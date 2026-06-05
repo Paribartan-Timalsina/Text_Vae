@@ -55,7 +55,7 @@ class SequenceVAE(nn.Module):
         self.decoder = VAEDecoder(
             latent_dim=config.latent_dim,
             embed_dim=config.embed_dim,
-            num_layers=config.num_layers,
+            num_layers=config.decoder_num_layers or config.num_layers,
             num_heads=config.num_heads,
             dropout=config.dropout,
             max_answer_len=config.max_answer_len,

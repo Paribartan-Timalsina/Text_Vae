@@ -107,6 +107,19 @@ def _validate(
         result["has_ans_em"] = squad["has_ans_em"]
         result["has_ans_f1"] = squad["has_ans_f1"]
 
+        # BLEU over ANSWERABLE examples only — the failing case we're chasing
+        # (nulls have empty references and would just inflate the score). Multi-
+        # reference, normalized identically to EM/F1. 0-100 scale.
+        from src.evaluation.text_metrics import compute_bleu_multiref
+
+        ans_preds, ans_refs = [], []
+        for pred, golds in zip(all_preds, all_refs):
+            if bool(golds) and any(g.strip() for g in golds):
+                ans_preds.append(pred)
+                ans_refs.append(golds)
+        bleu = compute_bleu_multiref(ans_preds, ans_refs)
+        result["has_ans_bleu"] = bleu.get("bleu", float("nan"))
+
         # Stash a few decoded samples so the caller can log them to W&B for
         # eyeballing what the decoder actually generates. Prefer answerable
         # examples (the failing case) but include a couple of nulls too.
@@ -160,13 +173,15 @@ def train_vae(
     from src.data.tokenization import create_tokenizer
 
     if train_loader is None or val_loader is None:
-        from src.data.loaders import create_squad_dataloaders
+        from src.data.loaders import create_vae_dataloaders
 
         tokenizer = create_tokenizer(config.encoder.model_name)
         # Subsample NULL examples in the VAE training set (and skip the
         # answerability-balanced sampler) so reconstruction gradient focuses on
         # real answer text. Export/classifier/diffusion still use the full set.
-        train_loader, val_loader = create_squad_dataloaders(
+        # Dispatches on vae_training.dataset; null_train_fraction is ignored for
+        # the EntailmentBank corpus (it has no NULLs).
+        train_loader, val_loader = create_vae_dataloaders(
             config,
             tokenizer,
             null_train_fraction=config.vae_training.null_train_fraction,
@@ -189,8 +204,7 @@ def train_vae(
         target_vocab_size=vocab_size,
         target_embed_dim=config.vae_arch.embed_dim,
     ).to(device)
-    breakpoint()
-    
+
     vae = SequenceVAE(config.vae_arch, pretrained_embeddings=pretrained_emb).to(device)
 
     tc = config.vae_training
@@ -480,6 +494,7 @@ def train_vae(
                         "val/f1": val_metrics.get("f1", float("nan")),
                         "val/has_ans_em": val_metrics.get("has_ans_em", float("nan")),
                         "val/has_ans_f1": val_metrics.get("has_ans_f1", float("nan")),
+                        "val/has_ans_bleu": val_metrics.get("has_ans_bleu", float("nan")),
                         "epoch": epoch,
                     },
                     step=global_step,

@@ -1,4 +1,4 @@
-"""Data loading, tokenization, and sampling utilities (VAE-only)."""
+"""Data loading, tokenization, and sampling utilities."""
 
 from src.data.tokenization import create_tokenizer, get_null_token_id
 from src.data.squad_dataset import SQuADItem, SQuADDataset

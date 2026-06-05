@@ -3,6 +3,7 @@ from src.config.schema import (
     EncoderConfig,
     VAEArchConfig,
     VAETrainingConfig,
+    QualityGateConfig,
     PathConfig,
 )
 from src.config.loader import load_config, create_config_from_cli

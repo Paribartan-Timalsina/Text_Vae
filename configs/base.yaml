@@ -1,0 +1,15 @@
+# Base configuration — shared across all pipelines
+seed: 42
+
+paths:
+  data_dir: "data"
+  checkpoint_dir: "checkpoints"
+  latent_dir: "latents"
+  output_dir: "outputs"
+
+encoder:
+  model_name: "bert-base-uncased"    # Pretrained encoder model
+  hidden_dim: 768                     # Must match model's hidden size
+  max_context_len: 384                # Max tokens for context passage
+  max_question_len: 64                # Max tokens for question
+  unfreeze_top_n: 0                   # Keep entire encoder frozen

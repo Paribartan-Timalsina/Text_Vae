@@ -1,4 +1,4 @@
-"""Cross-field validation for the VAE Config object."""
+"""Cross-field validation for the Config object."""
 
 from __future__ import annotations
 
@@ -11,13 +11,7 @@ def validate_config(config: Config) -> None:
     if config.vae_arch.latent_dim <= 0:
         raise ValueError(f"latent_dim must be > 0, got {config.vae_arch.latent_dim}")
     if config.vae_arch.max_answer_len <= 0:
-        raise ValueError(
-            f"max_answer_len must be > 0, got {config.vae_arch.max_answer_len}"
-        )
-    if config.vae_arch.num_latent_tokens <= 0:
-        raise ValueError(
-            f"num_latent_tokens must be > 0, got {config.vae_arch.num_latent_tokens}"
-        )
+        raise ValueError(f"max_answer_len must be > 0, got {config.vae_arch.max_answer_len}")
 
     # Beta schedule ordering
     if config.vae_training.beta_start >= config.vae_training.beta_end:
@@ -26,10 +20,7 @@ def validate_config(config: Config) -> None:
             f"beta_end ({config.vae_training.beta_end})"
         )
 
-    # Beta schedule type
-    valid_schedules = ("monotonic", "cyclical")
-    if config.vae_training.beta_schedule not in valid_schedules:
-        raise ValueError(
-            f"beta_schedule must be one of {valid_schedules}, "
-            f"got '{config.vae_training.beta_schedule}'"
-        )
+    # EMA decay range
+    ema = config.vae_training.ema_decay
+    if not (0.0 < ema < 1.0):
+        raise ValueError(f"ema_decay must be in (0, 1), got {ema}")

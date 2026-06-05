@@ -1,4 +1,4 @@
-"""DataLoader factory functions (VAE / SQuAD only)."""
+"""DataLoader factory functions."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Tuple
 from torch.utils.data import DataLoader, default_collate
 
 from src.config.schema import Config
+from src.data.tokenization import create_tokenizer
 from src.data.squad_dataset import SQuADDataset
 from src.data.sampler import create_balanced_sampler
 
@@ -34,6 +35,7 @@ def _subsample_to_null_fraction(data, null_fraction: float, seed: int = 42):
     inflates that to 50%, which starves the VAE's real-answer reconstruction.
     """
     import random
+
     answers = data["answers"]  # column access: list of {"text": [...], ...}
     ans_idx = [i for i, a in enumerate(answers) if len(a["text"]) > 0]
     null_idx = [i for i, a in enumerate(answers) if len(a["text"]) == 0]
@@ -68,7 +70,8 @@ def create_squad_dataloaders(
         subsampled to this fraction and the training loader uses plain
         shuffling instead of the answerability-balanced sampler (which would
         re-inflate nulls to 50%). The validation set is left at its natural
-        distribution.
+        distribution. When ``None`` (e.g. for ``export_latents``) the original
+        balanced-sampler behaviour over the full dataset is preserved.
     """
     from datasets import load_dataset
 
@@ -121,3 +124,85 @@ def create_squad_dataloaders(
         collate_fn=_squad_collate,
     )
     return train_loader, val_loader
+
+
+def create_entailment_dataloaders(
+    config: Config,
+    tokenizer,
+) -> Tuple[DataLoader, DataLoader]:
+    """Train/val DataLoaders over EntailmentBank explanatory sentences.
+
+    Follows the LangVAE paper (arXiv:2505.00004): all explanatory sentences,
+    deduplicated, 99/1 split (seed=42). No NULLs, so no balanced sampler and no
+    null subsampling — plain shuffling. Emits the SQuAD batch schema so the rest
+    of the VAE pipeline is unchanged.
+    """
+    from src.data.entailment_dataset import (
+        EntailmentBankDataset,
+        collect_explanatory_sentences,
+    )
+
+    sentences = collect_explanatory_sentences()
+
+    # 99/1 split, deterministic. Shuffle once with a fixed seed so the held-out
+    # 1% is a random slice rather than the tail of the dedup-ordered pool.
+    import random
+
+    rng = random.Random(42)
+    order = list(range(len(sentences)))
+    rng.shuffle(order)
+    shuffled = [sentences[i] for i in order]
+    n_val = max(1, round(len(shuffled) * 0.01))
+    val_sents = shuffled[:n_val]
+    train_sents = shuffled[n_val:]
+
+    ds_kwargs = dict(
+        tokenizer=tokenizer,
+        max_answer_len=config.vae_arch.max_answer_len,
+        max_context_len=config.encoder.max_context_len,
+        max_question_len=config.encoder.max_question_len,
+    )
+    train_ds = EntailmentBankDataset(sentences=train_sents, **ds_kwargs)
+    val_ds = EntailmentBankDataset(sentences=val_sents, **ds_kwargs)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=config.vae_training.batch_size,
+        shuffle=True,
+        num_workers=0,
+        drop_last=True,
+        collate_fn=_squad_collate,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config.vae_training.batch_size,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+        collate_fn=_squad_collate,
+    )
+    return train_loader, val_loader
+
+
+def create_vae_dataloaders(
+    config: Config,
+    tokenizer,
+    null_train_fraction: float | None = None,
+) -> Tuple[DataLoader, DataLoader]:
+    """Dispatch to the VAE training corpus selected by ``vae_training.dataset``.
+
+    ``"squad_v2"`` → :func:`create_squad_dataloaders` (honours
+    ``null_train_fraction``). ``"entailment_bank"`` →
+    :func:`create_entailment_dataloaders` (no NULLs; ``null_train_fraction`` is
+    ignored).
+    """
+    name = config.vae_training.dataset
+    if name == "squad_v2":
+        return create_squad_dataloaders(
+            config, tokenizer, null_train_fraction=null_train_fraction
+        )
+    if name == "entailment_bank":
+        return create_entailment_dataloaders(config, tokenizer)
+    raise ValueError(
+        f"Unknown vae_training.dataset={name!r}; expected 'squad_v2' or 'entailment_bank'"
+    )
