@@ -1,0 +1,63 @@
+# Standalone VAE configuration (base + vae sections merged into one file).
+seed: 42
+
+paths:
+  data_dir: "data"
+  checkpoint_dir: "checkpoints"
+  output_dir: "outputs"
+
+encoder:
+  model_name: "bert-base-uncased" # Pretrained encoder / tokenizer
+  hidden_dim: 768 # Must match the model's hidden size
+  max_context_len: 256 # Max tokens for context passage. p95=264, p99=354; 256
+  # truncates only ~5.6% of SQuAD contexts while cutting attention cost ~56% vs 384.
+  max_question_len: 32 # Max tokens for question. p99=26, so 32 truncates ~0.1%.
+  unfreeze_top_n: 0 # Keep the encoder embeddings as initialised
+
+vae_arch:
+  latent_dim: 128 # Latent vector dimensionality
+  embed_dim: 768 # Internal embedding dim (match encoder)
+  num_layers: 4 # Transformer layers in VAE encoder/decoder
+  num_heads: 8 # Attention heads per layer
+  dropout: 0.1 # Dropout rate
+  max_answer_len: 24 # Max answer sequence length. SQuAD answers: p99=16 tokens,
+  # so 24 truncates ~0.2% while shortening the autoregressive decode.
+  num_latent_tokens: 8 # K latent slots. K*D = 8*128 = 1024 latent dims. Halved
+  # from 16: SQuAD answers are 1-5 words, so 2048 dims was over-capacity and
+  # trivially collapsed.
+  latent_pos_inject: true # Add a K-pooled projection of z to EVERY decoder token
+  # input (not only the KV prefix), so the causal decoder cannot bypass z.
+  use_bow_head: true # Bag-of-words head predicting the answer's token set from z
+  # alone (Zhao et al. 2017). Trained via vae_training.bow_loss_weight.
+
+vae_training:
+  learning_rate: 5.0e-4 # Peak LR for AdamW (warmup stabilises the higher peak)
+  batch_size: 8 # Samples per training batch (small to fit 16GB GPU)
+  epochs: 30 # Maximum training epochs
+  patience: 5 # Early stopping patience (val checks)
+  warmup_steps: 500 # LR warmup steps
+  weight_decay: 0.01 # AdamW weight decay (mu_head/logvar_head are excluded)
+  grad_clip_max_norm: 5.0 # Max gradient norm
+  grad_accum_steps: 8 # Gradient accumulation steps (8 x batch_size 8 = effective 64)
+  beta_start: 0.01 # KL weight start
+  beta_end: 1.0 # KL weight end
+  beta_warmup_steps: 10000 # Steps to ramp beta (monotonic schedule only)
+  beta_schedule: cyclical # "monotonic" or "cyclical" (Fu et al. 2019). Cyclical
+  # repeatedly drops beta back to beta_start, giving the decoder periodic low-KL
+  # windows to (re)learn to use z.
+  beta_cycles: 40 # Number of annealing cycles (cyclical only)
+  beta_cycle_ratio: 0.5 # Fraction of each cycle spent ramping
+  free_bits: 0.02 # Per-dim KL ALLOWANCE (Kingma 2016): no penalty below this. It
+  # does NOT push KL up — watch train/true_kl (unclamped), not train/kl, for health.
+  ema_decay: 0.999 # EMA decay rate for validation weights
+  target_kl: null # KL hinge disabled (rely on beta-warmup + free_bits)
+  val_every_n_steps: 500 # Validate every N training steps
+  noise_aug_sigma: 0.1 # Extra Gaussian std injected into z before decode
+  noise_aug_prob: 0.5 # Probability of applying noise augmentation each step
+  null_train_fraction: 0.10 # Keep only 10% NULL / 90% answerable in the VAE train set
+  null_loss_weight: 0.1 # Downweight NULL examples' reconstruction loss (answerable = 1.0)
+  word_dropout: 0.5 # Prob of replacing each teacher-forced decoder INPUT token with
+  # [MASK] (Bowman 2016). Forces the decoder to use latent z instead of copying the
+  # previous gold token.
+  bow_loss_weight: 0.5 # Weight on the bag-of-words auxiliary loss (needs
+  # vae_arch.use_bow_head). The primary collapse cure; set 0 to disable.
