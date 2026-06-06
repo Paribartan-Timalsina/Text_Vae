@@ -26,8 +26,10 @@ decoder:
   max_answer_len: 50 # Max decoder tokens (reconstruction target length).
   latent_pos_inject: true # Add a K-pooled projection of z to every decoder token
   # embedding so z is reachable at each step and cannot be bypassed.
-  use_lora: false # LoRA on the decoder — the "beat LangVAE" lever. OFF for the
-  # first working milestone; turn on as an ablation. <1% trainable params.
+  use_lora: true # LoRA on the decoder. A fully frozen GPT-2 has no trainable
+  # path to learn to READ the injected latent, so it bypasses z and generates
+  # from its prior (fluent but unrelated text, val/f1_gap≈0.03). LoRA gives it
+  # that path — the primary cure for strong-decoder latent bypass. <1% params.
   lora_r: 16
   lora_alpha: 32
   lora_dropout: 0.05
@@ -61,9 +63,14 @@ vae_training:
   noise_aug_prob: 0.0
   null_train_fraction: 0.10 # Keep 10% NULL / 90% answerable in VAE training (SQuAD).
   null_loss_weight: 0.1 # Downweight NULL reconstruction loss.
-  word_dropout: 0.0 # OFF — from-scratch crutch; the frozen decoder doesn't need it.
-  bow_loss_weight: 0.0 # OFF (requires use_bow_head).
-  zforce_weight: 0.0 # OFF — from-scratch crutch.
+  word_dropout: 0.5 # Replace 50% of teacher-forced decoder INPUT tokens with a
+  # RANDOM token (Bowman 2016). Removes the teacher-forcing crutch so the decoder
+  # must read z to predict tokens 2…N, not just the first — anti-bypass cure for
+  # the strong frozen decoder. (GPT-2 has no [MASK]; decoder.py uses random ids.)
+  bow_loss_weight: 0.0 # OFF (reserve lever; requires use_bow_head).
+  zforce_weight: 1.0 # Second decode with word_dropout=1.0 (ALL inputs corrupted)
+  # so the decoder reconstructs from the z-prefix ALONE — generation-like
+  # conditions, directly training z-usage. The other half of the anti-bypass cure.
 
 quality_gate:
   min_recon_accuracy: 0.85 # Min token-level reconstruction accuracy

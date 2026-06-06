@@ -127,8 +127,12 @@ class VAEDecoder(nn.Module):
         are sliced so position ``i`` of the output predicts ``token_ids[:, i]``.
 
         ``word_dropout`` optionally replaces a random subset of *input* tokens
-        with ``mask_token_id`` (Bowman et al. 2016) to further discourage latent
-        bypass; targets are unchanged.
+        with a **random vocab id** (Bowman et al. 2016) to discourage latent
+        bypass; targets are unchanged. A random token (not a fixed mask id) is
+        used because GPT-2 BPE has no ``[MASK]`` and ``eos`` would mislead the
+        decoder into stopping. At ``word_dropout=1.0`` (the z-forcing pass) the
+        entire input becomes noise, so the decoder must reconstruct from the
+        z-prefix alone. ``mask_token_id`` is kept only as the on/off gate.
         """
         B, L = token_ids.shape
         K = self.num_latent_tokens
@@ -137,7 +141,8 @@ class VAEDecoder(nn.Module):
         if self.training and word_dropout > 0.0 and mask_token_id is not None:
             real = mask > 0
             drop = (torch.rand_like(in_ids, dtype=torch.float) < word_dropout) & real
-            in_ids = torch.where(drop, torch.full_like(in_ids, mask_token_id), in_ids)
+            rand_ids = torch.randint_like(in_ids, low=0, high=self.vocab_size)
+            in_ids = torch.where(drop, rand_ids, in_ids)
 
         tok_emb = self._input_embeddings()(in_ids)  # (B, L, H)
         ctx = self._context(z)

@@ -43,9 +43,10 @@ class DecoderConfig:
     latent_pos_inject: bool = True  # Add a K-pooled projection of z to EVERY
     # decoder token embedding (not just the K-token prefix). Keeps z reachable at
     # every step so the frozen decoder cannot ignore it.
-    use_lora: bool = False  # Attach LoRA adapters to the decoder (the "beat
-    # LangVAE" lever — relaxes its frozen-decoder convergence limitation at <1%
-    # trainable params). OFF by default; the architecture fix does not need it.
+    use_lora: bool = True  # Attach LoRA adapters to the decoder. A fully frozen
+    # decoder has no trainable path to learn to read the injected latent and so
+    # bypasses z (fluent but unconditioned output); LoRA gives it that path — the
+    # primary cure for strong-decoder latent bypass. <1% trainable params.
     lora_r: int = 16  # LoRA rank.
     lora_alpha: int = 32  # LoRA scaling.
     lora_dropout: float = 0.05  # LoRA dropout.
@@ -130,17 +131,15 @@ class VAETrainingConfig:
     # to NULL examples (answerable examples keep weight 1.0). Further rebalances
     # the decoder's gradient toward answer text without removing nulls — they
     # still pass through the encoder so their latents stay structured for export.
-    word_dropout: float = 0.1  # Probability of replacing each teacher-forced
-    # decoder INPUT token with [MASK] during training (Bowman et al. 2016).
-    # free_bits (=0.3) is the actual collapse cure — isolation showed free_bits
-    # alone recovers reconstruction (acc 0.90) while word_dropout=0.5 HURT it
-    # (acc 0.38, slower convergence). Kept small (0.1) as mild robustness for the
-    # imperfect diffusion-sampled latents at inference. 0.0 disables.
+    word_dropout: float = 0.5  # Probability of replacing each teacher-forced
+    # decoder INPUT token with a RANDOM token during training (Bowman et al.
+    # 2016). Removes the teacher-forcing crutch so a strong frozen decoder must
+    # read z to predict tokens 2…N (anti-bypass). 0.0 disables.
     bow_loss_weight: float = 0.0  # Weight on the bag-of-words auxiliary loss
     # (requires vae_arch.use_bow_head). Added directly to the total loss like a
     # second reconstruction term; uses the same per-sequence-sum reduction so
     # the weight is comparable to recon. 0.0 disables. ~0.3-1.0 is typical.
-    zforce_weight: float = 0.0  # Weight on the z-forcing auxiliary pass (Goyal
+    zforce_weight: float = 1.0  # Weight on the z-forcing auxiliary pass (Goyal
     # et al. 2017). A SECOND teacher-forced decode of the SAME decoder run with
     # word_dropout=1.0 — every input token is [MASK], so the decoder must
     # reconstruct from z (+ position) ALONE. Trains the deployed decoder under
