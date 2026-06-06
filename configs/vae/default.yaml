@@ -65,23 +65,33 @@ vae_training:
   # KL toward ~0.15 nats/dim across 2048 dims — i.e. toward collapse. Rely on
   # β-warmup + free_bits to regulate KL instead.
   val_every_n_steps: 500 # Validate every N training steps
-  noise_aug_sigma: 0.1 # Extra Gaussian std injected into z before decode (decoder noise robustness)
-  noise_aug_prob: 0.5 # Probability of applying noise augmentation each step
+  noise_aug_sigma: 0.0 # Extra Gaussian std injected into z before decode (decoder
+  # noise robustness). Set 0.0 while fixing posterior collapse: perturbing z
+  # degrades the very signal we are trying to force the decoder to read. Re-enable
+  # (~0.1) for diffusion-time robustness ONLY after val/f1_gap confirms z is used.
+  noise_aug_prob: 0.0 # Probability of applying noise augmentation each step
   null_train_fraction: 0.10 # Keep only 10% NULL / 90% answerable in the VAE training set
   # (SQuAD v2 is ~33% null; the old balanced sampler inflated it to 50%). Export,
   # classifier and diffusion still use the FULL dataset — this only affects VAE training.
   null_loss_weight: 0.1 # Downweight NULL examples' reconstruction loss (answerable = 1.0)
-  word_dropout: 0.1 # Prob of replacing each teacher-forced decoder INPUT token with
-  # [MASK] during training (Bowman 2016). NOTE: free_bits (=0.3) is what actually
-  # prevents collapse — isolation showed free_bits=0.3 ALONE recovers reconstruction
-  # (acc 0.90), while word_dropout=0.5 HURT it (acc 0.38 at the same step count) by
-  # making the task harder and slowing convergence. Kept small (0.1) only as mild
-  # robustness so the decoder doesn't over-rely on perfect teacher tokens for the
-  # imperfect diffusion-sampled latents at inference. Raise only if z is underused.
-  bow_loss_weight: 0.5 # Weight on the bag-of-words auxiliary loss (needs
+  word_dropout: 0.4 # Prob of replacing each teacher-forced decoder INPUT token with
+  # [MASK] during training (Bowman 2016). Raised 0.1→0.4: the previous run still
+  # collapsed (val EM=0, f1≈0.12, KL pinned at the free_bits floor) because 90% of
+  # the gold prev-tokens still leaked and the decoder modelled p(answer) from them,
+  # ignoring z. 0.4 starves that bypass much harder on the main pass; the z-forcing
+  # pass below (full masking) does the rest. Earlier "wd hurt" finding was under the
+  # old free_bits=0.3 prop regime — re-evaluate via val/f1_gap, not train recon.
+  zforce_weight: 1.0 # Weight on the z-forcing pass (Goyal 2017): a SECOND decode
+  # of the same decoder with word_dropout=1.0 (every input token masked) so it must
+  # reconstruct from z + position ALONE — i.e. under generation-like conditions, no
+  # gold-token bypass. This trains the DEPLOYED decoder to use z (unlike the BoW
+  # head, which only constrains the encoder side). Primary cure for the teacher-
+  # forced/generation gap. 1.0 ≈ one extra reconstruction term. Requires [MASK].
+  bow_loss_weight: 3.0 # Weight on the bag-of-words auxiliary loss (needs
   # vae_arch.use_bow_head). Forces z to encode which answer tokens appear,
-  # independent of the autoregressive decoder. Same per-sequence-sum reduction as
-  # recon, so 0.5 makes it ~half a reconstruction term. The primary collapse cure.
+  # independent of the autoregressive decoder. Bumped 0.5→3.0: prior run left bow≈76
+  # (near-uniform — z encoded almost no token identity), so the signal was too weak
+  # to move the encoder against the KL pull. Encoder-side backstop to z-forcing.
 
 quality_gate:
   min_recon_accuracy: 0.85 # Min token-level reconstruction accuracy

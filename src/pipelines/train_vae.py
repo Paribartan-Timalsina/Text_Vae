@@ -45,6 +45,12 @@ def _validate(
     n_batches = 0
     all_preds: list[str] = []
     all_refs: list[list[str]] = []
+    # Latent-ablation probe: decode each example a SECOND time from a wrong
+    # latent (μ rolled by one within the batch). If predictions barely change
+    # vs the real-μ decode, the decoder is ignoring z (posterior collapse); a
+    # large f1 gap means z genuinely drives the output. This is the only honest
+    # collapse signal — KL can sit pinned at the free_bits floor regardless.
+    all_preds_shuf: list[str] = []
 
     # Use the deterministic latent (μ) for evaluation and the model's own
     # autoregressive decoder so EM/F1 reflect real inference behaviour rather
@@ -88,12 +94,27 @@ def _validate(
                 pred_ids = vae.decode_to_tokens(
                     mu, strategy="greedy", max_len=gen_max_len, eos_token_id=eos_token_id
                 )  # (B, max_len)
+
+                # Decode again from a shuffled (wrong) latent for the ablation
+                # probe. Roll by one within the batch so every example gets a
+                # mismatched μ; a 1-element batch can't be shuffled so reuse μ.
+                mu_shuf = torch.roll(mu, shifts=1, dims=0) if mu.size(0) > 1 else mu
+                pred_ids_shuf = vae.decode_to_tokens(
+                    mu_shuf, strategy="greedy", max_len=gen_max_len,
+                    eos_token_id=eos_token_id,
+                )
+
                 for i in range(pred_ids.size(0)):
                     pred_text = tokenizer.decode(
                         pred_ids[i].tolist(), skip_special_tokens=True
                     ).strip()
                     all_preds.append(pred_text)
                     all_refs.append(batch["all_answer_texts"][i])
+                    all_preds_shuf.append(
+                        tokenizer.decode(
+                            pred_ids_shuf[i].tolist(), skip_special_tokens=True
+                        ).strip()
+                    )
 
     if n_batches == 0:
         return totals
@@ -106,6 +127,17 @@ def _validate(
         result["f1"] = squad["f1"]
         result["has_ans_em"] = squad["has_ans_em"]
         result["has_ans_f1"] = squad["has_ans_f1"]
+
+        # Latent-ablation probe: f1 of the wrong-latent decode against the same
+        # references, and the gap vs the real-latent f1. f1_gap ≈ 0 → decoder
+        # ignores z (collapse); large positive gap → z drives the output. Use
+        # f1_gap (not KL) as the trustworthy anti-collapse signal.
+        if all_preds_shuf:
+            squad_shuf = compute_squad_metrics(all_preds_shuf, all_refs)
+            result["f1_shuffled"] = squad_shuf["f1"]
+            result["f1_gap"] = squad["f1"] - squad_shuf["f1"]
+            result["has_ans_f1_shuffled"] = squad_shuf["has_ans_f1"]
+            result["has_ans_f1_gap"] = squad["has_ans_f1"] - squad_shuf["has_ans_f1"]
 
         # BLEU over ANSWERABLE examples only — the failing case we're chasing
         # (nulls have empty references and would just inflate the score). Multi-
@@ -266,7 +298,13 @@ def train_vae(
     # ------------------------------------------------------------------ wandb
     init_wandb(config.to_dict(), project="latent-diffusion-text-vae")
 
-    best_val_loss = float("inf")
+    # Select the best checkpoint on val has_ans_f1 (real autoregressive
+    # generation quality), NOT on val total loss. Total loss is dominated by the
+    # teacher-forced reconstruction term, which keeps dropping as the decoder
+    # memorises the corpus marginal — entirely independent of whether z is used.
+    # Selecting on it happily saves a fully posterior-collapsed model (EM/F1 ~0).
+    # has_ans_f1 reflects generation from z alone, so it tracks actual z-use.
+    best_val_f1 = -float("inf")
     patience_counter = 0
     global_step = 0
     final_metrics: dict[str, float] = {}
@@ -281,6 +319,7 @@ def train_vae(
             "recon": 0.0,
             "kl": 0.0,
             "bow": 0.0,
+            "recon_zonly": 0.0,
             "true_kl": 0.0,
             "grad_norm": 0.0,
             "mu_mean": 0.0,
@@ -357,6 +396,7 @@ def train_vae(
                 word_dropout=tc.word_dropout,
                 mask_token_id=word_dropout_id,
                 bow_weight=tc.bow_loss_weight,
+                zforce_weight=tc.zforce_weight,
             )
             loss = loss_dict["total"] / tc.grad_accum_steps
             loss.backward()
@@ -390,6 +430,7 @@ def train_vae(
                 "recon": loss_dict["recon"].item(),
                 "kl": loss_dict["kl"].item(),
                 "bow": loss_dict["bow"].item(),
+                "recon_zonly": loss_dict["recon_zonly"].item(),
                 "true_kl": true_kl,
                 "grad_norm": grad_norm,
                 "mu_mean": mu.mean().item(),
@@ -420,6 +461,7 @@ def train_vae(
                     "train/recon": step_metrics["recon"],
                     "train/kl": step_metrics["kl"],
                     "train/bow": step_metrics["bow"],
+                    "train/recon_zonly": step_metrics["recon_zonly"],
                     "train/true_kl": step_metrics["true_kl"],
                     "train/grad_norm": step_metrics["grad_norm"],
                     "train/beta": beta,
@@ -475,13 +517,16 @@ def train_vae(
                                     ans, f1, gold, pred)
                 final_metrics = val_metrics
                 logger.info(
-                    "step=%d  val_loss=%.4f  recon=%.4f  kl=%.4f  em=%.3f  f1=%.3f",
+                    "step=%d  val_loss=%.4f  recon=%.4f  kl=%.4f  em=%.3f  f1=%.3f  "
+                    "f1_shuf=%.3f  f1_gap=%.3f",
                     global_step,
                     val_metrics["total"],
                     val_metrics["recon"],
                     val_metrics["kl"],
                     val_metrics.get("em", float("nan")),
                     val_metrics.get("f1", float("nan")),
+                    val_metrics.get("f1_shuffled", float("nan")),
+                    val_metrics.get("f1_gap", float("nan")),
                 )
                 log_wandb(
                     {
@@ -495,13 +540,17 @@ def train_vae(
                         "val/has_ans_em": val_metrics.get("has_ans_em", float("nan")),
                         "val/has_ans_f1": val_metrics.get("has_ans_f1", float("nan")),
                         "val/has_ans_bleu": val_metrics.get("has_ans_bleu", float("nan")),
+                        "val/f1_shuffled": val_metrics.get("f1_shuffled", float("nan")),
+                        "val/f1_gap": val_metrics.get("f1_gap", float("nan")),
+                        "val/has_ans_f1_gap": val_metrics.get("has_ans_f1_gap", float("nan")),
                         "epoch": epoch,
                     },
                     step=global_step,
                 )
 
-                if val_metrics["total"] < best_val_loss:
-                    best_val_loss = val_metrics["total"]
+                current_f1 = val_metrics.get("has_ans_f1", float("nan"))
+                if current_f1 > best_val_f1:
+                    best_val_f1 = current_f1
                     patience_counter = 0
                     ckpt_path = Path(config.paths.checkpoint_dir) / "vae_best.pt"
                     ema.apply()

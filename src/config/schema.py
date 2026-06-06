@@ -116,6 +116,15 @@ class VAETrainingConfig:
     # (requires vae_arch.use_bow_head). Added directly to the total loss like a
     # second reconstruction term; uses the same per-sequence-sum reduction so
     # the weight is comparable to recon. 0.0 disables. ~0.3-1.0 is typical.
+    zforce_weight: float = 0.0  # Weight on the z-forcing auxiliary pass (Goyal
+    # et al. 2017). A SECOND teacher-forced decode of the SAME decoder run with
+    # word_dropout=1.0 — every input token is [MASK], so the decoder must
+    # reconstruct from z (+ position) ALONE. Trains the deployed decoder under
+    # generation-like conditions (no gold prev-token bypass) while the primary
+    # word_dropout=word_dropout pass preserves inter-token fluency. The direct
+    # cure for the teacher-forced/generation gap (good train recon, EM/F1 ~0).
+    # Added to total like a second recon term (same reduction), so the weight is
+    # comparable to recon. 0.0 disables. Requires a mask token id (BERT [MASK]).
 
 
 @dataclass(frozen=True)

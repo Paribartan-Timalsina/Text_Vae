@@ -128,6 +128,7 @@ class SequenceVAE(nn.Module):
         word_dropout: float = 0.0,
         mask_token_id: int | None = None,
         bow_weight: float = 0.0,
+        zforce_weight: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Full forward pass (teacher-forced).
 
@@ -180,7 +181,34 @@ class SequenceVAE(nn.Module):
             bow = compute_bow_loss(bow_logits, token_ids, mask)
             total = total + bow_weight * bow
 
-        loss_dict = {"total": total, "recon": recon, "kl": kl, "bow": bow}
+        # Z-forcing auxiliary pass (Goyal et al. 2017). A second teacher-forced
+        # decode of the SAME decoder with word_dropout=1.0 — every input token
+        # is masked, so the decoder reconstructs from z (+ position) ALONE. This
+        # trains the deployed decoder under generation-like conditions (no gold
+        # prev-token bypass), directly closing the teacher-forced/generation gap
+        # that drives EM/F1 to ~0 while train recon looks healthy. Only runs in
+        # training and only when a mask token id is available.
+        recon_zonly = total.new_zeros(())
+        if (
+            zforce_weight > 0.0
+            and self.training
+            and mask_token_id is not None
+        ):
+            zonly_logits = self.decode(
+                token_ids, z_decode, mask,
+                word_dropout=1.0, mask_token_id=mask_token_id,
+            )
+            _, recon_zonly, _ = compute_vae_loss(
+                zonly_logits, token_ids, mask, mu, log_var,
+                beta=0.0, free_bits=0.0, target_kl=None,
+                recon_weights=recon_weights,
+            )
+            total = total + zforce_weight * recon_zonly
+
+        loss_dict = {
+            "total": total, "recon": recon, "kl": kl,
+            "bow": bow, "recon_zonly": recon_zonly,
+        }
         return logits, z, mu, log_var, loss_dict
 
     def decode_to_tokens(
