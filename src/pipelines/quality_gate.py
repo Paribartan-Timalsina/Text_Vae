@@ -54,14 +54,18 @@ def run_quality_gate(
         for batch in dataloader:
             answer_ids = batch["answer_ids"].to(device)
             answer_mask = batch["answer_mask"].to(device)
+            dec_ids = batch["dec_answer_ids"].to(device)
+            dec_mask = batch["dec_answer_mask"].to(device)
             is_answerable = batch["is_answerable"].to(device)
 
-            logits, z, mu, log_var, loss_dict = vae(answer_ids, answer_mask)
+            logits, z, mu, log_var, loss_dict = vae(
+                answer_ids, answer_mask, dec_ids, dec_mask
+            )
 
-            # --- Token reconstruction accuracy ---
+            # --- Token reconstruction accuracy (teacher-forced, decoder vocab) ---
             pred_ids = logits.argmax(dim=-1)  # (B, L)
-            correct = ((pred_ids == answer_ids) * answer_mask).sum()
-            total = answer_mask.sum()
+            correct = ((pred_ids == dec_ids) * dec_mask).sum()
+            total = dec_mask.sum()
             all_token_correct += correct.item()
             all_token_total += total.item()
 

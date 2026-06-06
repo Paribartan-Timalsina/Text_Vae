@@ -7,7 +7,7 @@ from typing import Tuple
 from torch.utils.data import DataLoader, default_collate
 
 from src.config.schema import Config
-from src.data.tokenization import create_tokenizer
+from src.data.tokenization import create_tokenizer, create_decoder_tokenizer
 from src.data.squad_dataset import SQuADDataset
 from src.data.sampler import create_balanced_sampler
 
@@ -78,12 +78,15 @@ def create_squad_dataloaders(
     raw_train = load_dataset("squad_v2", split="train")
     splits = raw_train.train_test_split(test_size=0.1, seed=42)
 
+    decoder_tokenizer = create_decoder_tokenizer(config.decoder.model_name)
     ds_kwargs = dict(
         split="train",  # unused when data= is provided; kept for interface compat
         tokenizer=tokenizer,
         max_context_len=config.encoder.max_context_len,
         max_question_len=config.encoder.max_question_len,
         max_answer_len=config.vae_arch.max_answer_len,
+        decoder_tokenizer=decoder_tokenizer,
+        dec_max_answer_len=config.decoder.max_answer_len,
     )
 
     train_split = splits["train"]
@@ -161,6 +164,8 @@ def create_entailment_dataloaders(
         max_answer_len=config.vae_arch.max_answer_len,
         max_context_len=config.encoder.max_context_len,
         max_question_len=config.encoder.max_question_len,
+        decoder_tokenizer=create_decoder_tokenizer(config.decoder.model_name),
+        dec_max_answer_len=config.decoder.max_answer_len,
     )
     train_ds = EntailmentBankDataset(sentences=train_sents, **ds_kwargs)
     val_ds = EntailmentBankDataset(sentences=val_sents, **ds_kwargs)

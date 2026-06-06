@@ -65,12 +65,12 @@ def _export_latents_sequence_vae(
     tokenizer = create_tokenizer(saved_cfg.encoder.model_name)
     vocab_size = len(tokenizer)
 
-    # Placeholder embedding tensor — load_state_dict below overwrites it with
-    # the trained embeddings from the checkpoint.
-    placeholder_emb = torch.zeros(vocab_size, saved_cfg.vae_arch.embed_dim, device=device)
-
-    vae = SequenceVAE(saved_cfg.vae_arch, pretrained_embeddings=placeholder_emb).to(device)
-    vae.load_state_dict(ckpt["model_state_dict"])
+    vae = SequenceVAE(saved_cfg, encoder_vocab_size=vocab_size).to(device)
+    # strict=False: the frozen pretrained backbones are reloaded from HF at
+    # construction, so the checkpoint only needs to supply the trained adapters
+    # (Perceiver pool, variational heads, latent projections, LoRA). Any frozen
+    # backbone keys present in the checkpoint are also accepted.
+    vae.load_state_dict(ckpt["model_state_dict"], strict=False)
     vae.eval()
 
     train_loader, val_loader = create_squad_dataloaders(saved_cfg, tokenizer)

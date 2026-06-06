@@ -1,12 +1,13 @@
-"""VAE encoder: embeds token ids and produces a *sequence* of latent vectors.
+"""VAE encoder: a FROZEN pretrained transformer (e.g. BERT) + Perceiver-style
+query pool to a *sequence* of latent parameters.
 
-Earlier versions of this module pooled the entire input sequence into a
-single ``(B, D)`` vector. That was a punishing bottleneck for text and is
-also incompatible with a sequence-aware diffusion denoiser. The encoder
-now emits ``num_latent_tokens`` query-pooled vectors of shape ``(B, K, D)``
-via Perceiver-style cross-attention from K learnable queries onto the
-transformer output, preserving positional / sub-segment structure that
-diffusion can later attend over.
+This follows the LangVAE design (arXiv:2505.00004): the heavy language
+understanding is done by a frozen pretrained encoder, and only a small pooling
+head + variational projection are trained. The encoder emits
+``num_latent_tokens`` query-pooled vectors of shape ``(B, K, latent_dim)`` via
+Perceiver-style cross-attention from K learnable queries onto the frozen
+encoder's hidden states — the "sequence latent" that preserves sub-segment
+structure for a downstream diffusion denoiser (vs LangVAE's single vector).
 """
 
 from __future__ import annotations
@@ -14,99 +15,85 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from src.models.positional import sinusoidal_encoding as _sinusoidal_encoding
+from src.utils.pretrained_embeddings import load_pretrained_encoder_model
 
 
 class VAEEncoder(nn.Module):
-    """Bidirectional transformer + Perceiver-style query pool to a sequence
-    of latent parameters ``(μ, log_var)`` each of shape ``(B, K, latent_dim)``.
+    """Frozen pretrained backbone + Perceiver query pool → ``(μ, log_var)``.
 
-    The K learnable query tokens are randomly initialised parameters; each
-    query attends to the full encoder output and produces one latent vector.
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace ``AutoModel`` id (e.g. ``"bert-base-uncased"``).
+    latent_dim : int
+        Per-token latent dimensionality.
+    num_latent_tokens : int
+        Number of Perceiver query tokens K (latent sequence length).
+    num_heads : int
+        Attention heads for the cross-attention pool.
+    dropout : float
+        Dropout for the cross-attention pool.
+    vocab_size : int
+        Encoder-tokenizer vocab size (``len(tokenizer)``) — the backbone's input
+        embeddings are resized to this so added special tokens like
+        ``[NULL_ANS]`` are in range.
+    unfreeze_top_n : int
+        Number of top backbone encoder layers to leave trainable (0 = fully
+        frozen, the default / LangVAE setting).
     """
 
     def __init__(
         self,
-        embed_dim: int,
+        model_name: str,
         latent_dim: int,
-        num_layers: int,
+        num_latent_tokens: int,
         num_heads: int,
         dropout: float,
-        max_answer_len: int,
-        num_latent_tokens: int,
-        pretrained_embeddings: torch.Tensor | None = None,
+        vocab_size: int,
+        unfreeze_top_n: int = 0,
     ) -> None:
         super().__init__()
-
         self.num_latent_tokens = num_latent_tokens
 
-        # --- Embedding ---
-        if pretrained_embeddings is not None:
-            vocab_size, emb_d = pretrained_embeddings.shape
-            self.embedding = nn.Embedding(vocab_size, emb_d)
-            with torch.no_grad():
-                self.embedding.weight.copy_(pretrained_embeddings)
-        else:
-            raise ValueError(
-                "vocab_size must be inferred from pretrained_embeddings or set explicitly"
-            )
+        # --- Frozen pretrained backbone ---
+        self.backbone = load_pretrained_encoder_model(model_name, freeze=True)
+        # Cover special tokens added to the tokenizer (e.g. [NULL_ANS]).
+        if self.backbone.get_input_embeddings().weight.size(0) != vocab_size:
+            self.backbone.resize_token_embeddings(vocab_size)
+            self.backbone.requires_grad_(False)  # re-freeze any new rows
+        hidden = self.backbone.config.hidden_size
 
-        # --- Positional encoding (sinusoidal, non-learnable) ---
-        pe = _sinusoidal_encoding(max_answer_len, embed_dim)
-        self.register_buffer("pe", pe.unsqueeze(0))  # (1, L, D)
+        # Optionally unfreeze the top-N transformer layers of the backbone.
+        if unfreeze_top_n > 0:
+            self._unfreeze_top_layers(unfreeze_top_n)
 
-        # --- Transformer ---
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=4 * embed_dim,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # --- Perceiver-style latent queries ---
-        # K learnable query tokens that cross-attend to the encoder output.
+        # --- Perceiver-style latent queries (trained) ---
         self.latent_queries = nn.Parameter(
-            torch.randn(1, num_latent_tokens, embed_dim) * 0.02
+            torch.randn(1, num_latent_tokens, hidden) * 0.02
         )
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
+            embed_dim=hidden,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.cross_attn_norm_q = nn.LayerNorm(embed_dim)
-        self.cross_attn_norm_kv = nn.LayerNorm(embed_dim)
+        self.cross_attn_norm_q = nn.LayerNorm(hidden)
+        self.cross_attn_norm_kv = nn.LayerNorm(hidden)
 
-        # --- Projection to latent space (per-token) ---
-        self.proj = nn.Linear(embed_dim, latent_dim)
+        # --- Variational projection (trained) ---
+        self.proj = nn.Linear(hidden, latent_dim)
         self.mu_head = nn.Linear(latent_dim, latent_dim)
         self.logvar_head = nn.Linear(latent_dim, latent_dim)
 
-    @classmethod
-    def from_vocab_size(
-        cls,
-        vocab_size: int,
-        embed_dim: int,
-        latent_dim: int,
-        num_layers: int,
-        num_heads: int,
-        dropout: float,
-        max_answer_len: int,
-        num_latent_tokens: int,
-    ) -> "VAEEncoder":
-        emb = torch.randn(vocab_size, embed_dim)
-        return cls(
-            embed_dim,
-            latent_dim,
-            num_layers,
-            num_heads,
-            dropout,
-            max_answer_len,
-            num_latent_tokens,
-            emb,
-        )
+    def _unfreeze_top_layers(self, n: int) -> None:
+        """Set ``requires_grad=True`` on the top *n* backbone encoder layers."""
+        enc = getattr(self.backbone, "encoder", None)
+        layers = getattr(enc, "layer", None) if enc is not None else None
+        if layers is None:
+            return
+        for layer in list(layers)[-n:]:
+            for p in layer.parameters():
+                p.requires_grad_(True)
 
     def forward(
         self,
@@ -124,20 +111,18 @@ class VAEEncoder(nn.Module):
         -------
         (μ, log_var) each of shape (B, K, latent_dim)
         """
-        B, L = token_ids.shape
-        x = self.embedding(token_ids) + self.pe[:, :L, :]
-
+        B = token_ids.size(0)
         pad_mask = mask == 0  # True = ignore
-        x = self.transformer(x, src_key_padding_mask=pad_mask)
 
-        # Cross-attend K queries to the encoder output.
-        queries = self.latent_queries.expand(B, -1, -1)  # (B, K, D)
+        out = self.backbone(input_ids=token_ids, attention_mask=mask.long())
+        hidden = out.last_hidden_state  # (B, L, H)
+
+        # Cross-attend K queries to the frozen encoder output.
+        queries = self.latent_queries.expand(B, -1, -1)  # (B, K, H)
         q = self.cross_attn_norm_q(queries)
-        kv = self.cross_attn_norm_kv(x)
+        kv = self.cross_attn_norm_kv(hidden)
         pooled, _ = self.cross_attn(q, kv, kv, key_padding_mask=pad_mask)
-        # Residual on the queries so an untrained cross-attn doesn't zero out
-        # the signal at init.
-        pooled = queries + pooled  # (B, K, D)
+        pooled = queries + pooled  # residual so init cross-attn doesn't zero out
 
         h = self.proj(pooled)  # (B, K, latent_dim)
         mu = self.mu_head(h)

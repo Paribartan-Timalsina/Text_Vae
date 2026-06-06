@@ -1,97 +1,69 @@
 # VAE architecture and training configuration
+#
+# Architecture (post-rewrite): a FROZEN pretrained encoder (BERT) + FROZEN
+# pretrained causal-LM decoder (GPT-2), LangVAE-style. Only the Perceiver pool,
+# variational heads, latent-injection projections (and optional LoRA) are
+# trained. This is the fix for the from-scratch-decoder gibberish — a pretrained
+# LM already produces fluent text, so the VAE only learns to read/write z.
 vae_arch:
-  latent_dim: 128 # Latent vector dimensionality (pooled per sentence)
-  embed_dim: 768 # Internal embedding dim (match encoder)
-  num_layers: 4 # Transformer layers in the VAE ENCODER (decoder uses its own below)
-  decoder_num_layers: 2 # DECODER layers. Set BELOW the encoder's 4 on purpose: a
-  # 4-layer AR decoder modelled p(answer) from teacher-forced tokens alone and
-  # ignored z (powerful-decoder bypass — KL propped by free_bits but generation
-  # collapsed to NULL, val EM/F1 stuck at the null rate). Weaker decoder must lean
-  # on z. Encoder stays deep so the latent is still well-formed (lagging-encoder).
-  num_heads: 8 # Attention heads per layer
-  dropout: 0.1 # Dropout rate
-  max_answer_len: 50 # Max answer sequence length
-  num_latent_tokens: 4 # Pseudo-tokens for latent KV injection in decoder. 8→4 →
-  # K*D = 4*128 = 512 latent dims. SQuAD answers are 1-5 words, so 1024 dims was
-  # over-capacity and easy to bypass; 512 + weaker decoder forces efficient coding.
-  latent_pos_inject: true # Add a K-pooled projection of z to EVERY decoder token
-  # input (not only the KV prefix). The causal decoder could otherwise reconstruct
-  # short answers from teacher-forced tokens alone and ignore z → posterior collapse
-  # (gen = "the the and", active_dims → 0). Per-position injection makes z reachable
-  # at every step so it cannot be bypassed.
-  use_bow_head: true # Bag-of-words head predicting the answer's token set from z
-  # alone (Zhao et al. 2017). Trained via vae_training.bow_loss_weight; a decoder-
-  # independent gradient that keeps the latent informative.
+  latent_dim: 128 # Per-token latent dimensionality.
+  embed_dim: 768 # (Unused by the frozen backbones; kept for config compat.)
+  num_layers: 4 # (Unused — encoder is a frozen pretrained backbone now.)
+  decoder_num_layers: 2 # (Unused — decoder is a frozen pretrained LM now.)
+  num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
+  dropout: 0.1 # Dropout for the Perceiver pool.
+  max_answer_len: 50 # Max answer length on the ENCODER (BERT) side.
+  num_latent_tokens: 4 # K latent tokens — the "sequence latent" contribution.
+  # Ablate K=1 to compare directly against LangVAE's single latent vector.
+  latent_pos_inject: true # (Kept for compat; the decoder reads decoder.latent_pos_inject.)
+  use_bow_head: false # BoW anti-collapse head — OFF (a frozen pretrained decoder
+  # no longer collapses the way the from-scratch one did). Re-enable only if
+  # val/f1_gap stays ~0.
+
+decoder:
+  model_name: gpt2 # Frozen pretrained causal LM (the generator). Paper's highest
+  # reconstruction row (BERT+GPT-2). Scale to Qwen/Qwen2.5-1.5B as an ablation.
+  max_answer_len: 50 # Max decoder tokens (reconstruction target length).
+  latent_pos_inject: true # Add a K-pooled projection of z to every decoder token
+  # embedding so z is reachable at each step and cannot be bypassed.
+  use_lora: false # LoRA on the decoder — the "beat LangVAE" lever. OFF for the
+  # first working milestone; turn on as an ablation. <1% trainable params.
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
 
 vae_training:
-  dataset: squad_v2 # VAE corpus: "squad_v2" (short answer texts, has NULLs) or
-  # "entailment_bank" (EntailmentBank explanatory sentences, no NULLs; full
-  # declarative sentences). entailment_bank follows the LangVAE paper
-  # (arXiv:2505.00004): all explanatory "cot" sentences, deduped, 99/1 split.
-  learning_rate: 5.0e-4 # Peak learning rate for AdamW. 1e-4 was ~10x too low:
-  # recon stuck ~20 (acc ~0.25) in controlled tests; at 5e-4 the decoder learns
-  # to read the latent and recon drops sharply (acc >0.8). Warmup (500) stabilizes
-  # the higher peak. Drop to 3e-4 if loss spikes at full 768-dim scale.
-  batch_size: 64 # Samples per training batch
-  epochs: 30 # Maximum training epochs
-  patience: 5 # Early stopping patience (val checks)
-  warmup_steps: 500 # LR warmup steps
-  weight_decay: 0.01 # AdamW weight decay
-  grad_clip_max_norm: 5.0 # Max gradient norm. 1.0 was far too aggressive for a
-  # ~25M-param model dominated by the 30k×768 tied embedding: observed grad_norm
-  # sat at ~15-20 the whole run, so clip-to-1.0 throttled the effective LR ~15-20x
-  # and the model underfit (recon plateaued, F1/EM ~0). 5.0 lets real updates through.
-  grad_accum_steps: 1 # Gradient accumulation steps
-  beta_start: 0.01 # KL weight start (small positive avoids ignoring KL entirely)
-  beta_end: 0.5 # KL weight end. 1.0 crushed the decoder at cyclical β peaks: val
-  # EM/F1 dipped to 0 exactly when β reached 1.0 (~step 1.5k). Cap at 0.5.
-  beta_warmup_steps: 10000 # Steps to linearly ramp beta (monotonic schedule only)
-  beta_schedule: cyclical # "monotonic" or "cyclical" (Fu et al. 2019). Cyclical
-  # repeatedly drops beta back to beta_start, giving the decoder periodic low-KL
-  # windows to (re)learn to use z — a safeguard against the one-shot collapse seen
-  # under the monotonic ramp (everything died ~step 900 as beta first crossed ~0.1).
-  beta_cycles: 40 # Number of annealing cycles (cyclical only)
-  beta_cycle_ratio: 0.5 # Fraction of each cycle spent ramping
-  free_bits: 0.0625 # Per-dim KL ALLOWANCE (target-rate VAE). 0.02 collapsed (KL
-  # pinned at floor before decoder learned z); 0.3 OVER-corrected — floor K*D*0.3 ≈
-  # 307 over 1024 dims PROPPED train/kl to ~308 while the powerful decoder bypassed
-  # z (gen → NULL, val EM/F1 stuck at null rate ~0.33, true_kl decaying ~200→100).
-  # 0.0625 over the new K*D=512 floors KL at ~32 nats — a real target rate, not a
-  # prop. Safe now only because the decoder is also weakened (decoder_num_layers=2).
-  # Watch train/true_kl AND val EM/F1 together: KL alive ≠ z used. If gen still NULL,
-  # decoder still too strong → cut decoder_num_layers further before touching this.
-  ema_decay: 0.999 # EMA decay rate for validation weights
-  target_kl: null # KL hinge disabled. A finite value (e.g. 320) drives total
-  # KL toward ~0.15 nats/dim across 2048 dims — i.e. toward collapse. Rely on
-  # β-warmup + free_bits to regulate KL instead.
-  val_every_n_steps: 500 # Validate every N training steps
-  noise_aug_sigma: 0.0 # Extra Gaussian std injected into z before decode (decoder
-  # noise robustness). Set 0.0 while fixing posterior collapse: perturbing z
-  # degrades the very signal we are trying to force the decoder to read. Re-enable
-  # (~0.1) for diffusion-time robustness ONLY after val/f1_gap confirms z is used.
-  noise_aug_prob: 0.0 # Probability of applying noise augmentation each step
-  null_train_fraction: 0.10 # Keep only 10% NULL / 90% answerable in the VAE training set
-  # (SQuAD v2 is ~33% null; the old balanced sampler inflated it to 50%). Export,
-  # classifier and diffusion still use the FULL dataset — this only affects VAE training.
-  null_loss_weight: 0.1 # Downweight NULL examples' reconstruction loss (answerable = 1.0)
-  word_dropout: 0.4 # Prob of replacing each teacher-forced decoder INPUT token with
-  # [MASK] during training (Bowman 2016). Raised 0.1→0.4: the previous run still
-  # collapsed (val EM=0, f1≈0.12, KL pinned at the free_bits floor) because 90% of
-  # the gold prev-tokens still leaked and the decoder modelled p(answer) from them,
-  # ignoring z. 0.4 starves that bypass much harder on the main pass; the z-forcing
-  # pass below (full masking) does the rest. Earlier "wd hurt" finding was under the
-  # old free_bits=0.3 prop regime — re-evaluate via val/f1_gap, not train recon.
-  zforce_weight: 1.0 # Weight on the z-forcing pass (Goyal 2017): a SECOND decode
-  # of the same decoder with word_dropout=1.0 (every input token masked) so it must
-  # reconstruct from z + position ALONE — i.e. under generation-like conditions, no
-  # gold-token bypass. This trains the DEPLOYED decoder to use z (unlike the BoW
-  # head, which only constrains the encoder side). Primary cure for the teacher-
-  # forced/generation gap. 1.0 ≈ one extra reconstruction term. Requires [MASK].
-  bow_loss_weight: 3.0 # Weight on the bag-of-words auxiliary loss (needs
-  # vae_arch.use_bow_head). Forces z to encode which answer tokens appear,
-  # independent of the autoregressive decoder. Bumped 0.5→3.0: prior run left bow≈76
-  # (near-uniform — z encoded almost no token identity), so the signal was too weak
-  # to move the encoder against the KL pull. Encoder-side backstop to z-forcing.
+  dataset: squad_v2 # "squad_v2" (short answers, has NULLs) or "entailment_bank"
+  # (LangVAE paper corpus). SQuAD QA is the primary downstream task here.
+  learning_rate: 1.0e-3 # AdamW peak LR (paper §5.1: LR=0.001). Only the small
+  # trained heads/adapters see gradients, so a higher LR than a full-model train.
+  batch_size: 50 # Paper §5.1 batch size.
+  epochs: 50 # Paper §5.1 trains 50 epochs.
+  patience: 10 # Early-stopping patience (val checks).
+  warmup_steps: 500 # LR warmup steps.
+  weight_decay: 0.01 # AdamW weight decay (applies to trained heads only).
+  grad_clip_max_norm: 1.0 # Far fewer trainable params now — 1.0 is fine.
+  grad_accum_steps: 1
+  beta_start: 0.0 # KL weight at the start of each cycle.
+  beta_end: 1.0 # Max KL weight (paper max_beta=1.0). Safe now: the frozen
+  # pretrained decoder does not collapse like the from-scratch one.
+  beta_warmup_steps: 10000 # (monotonic schedule only)
+  beta_schedule: cyclical # Cyclical KL annealing (Fu et al. 2019), as in LangVAE.
+  beta_cycles: 40 # Paper §5.1: 40 beta annealing cycles.
+  beta_cycle_ratio: 0.5 # Fraction of each cycle spent ramping.
+  free_bits: 0.0 # OFF — the 32-nat free-bits floor was a from-scratch prop.
+  ema_decay: 0.999
+  target_kl: 2.0 # Paper §5.1: target_kl=2.0 (soft hinge — penalise only KL above
+  # this). The principled collapse control here, instead of free_bits.
+  val_every_n_steps: 500
+  noise_aug_sigma: 0.0 # Diffusion-time robustness; enable (~0.1) only after f1_gap
+  # confirms z is used.
+  noise_aug_prob: 0.0
+  null_train_fraction: 0.10 # Keep 10% NULL / 90% answerable in VAE training (SQuAD).
+  null_loss_weight: 0.1 # Downweight NULL reconstruction loss.
+  word_dropout: 0.0 # OFF — from-scratch crutch; the frozen decoder doesn't need it.
+  bow_loss_weight: 0.0 # OFF (requires use_bow_head).
+  zforce_weight: 0.0 # OFF — from-scratch crutch.
 
 quality_gate:
   min_recon_accuracy: 0.85 # Min token-level reconstruction accuracy

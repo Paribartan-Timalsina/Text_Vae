@@ -29,6 +29,7 @@ def _validate(
     target_kl: float | None = None,
     bow_weight: float = 0.0,
     tokenizer=None,
+    dec_tokenizer=None,
 ) -> dict[str, float]:
     """Run one pass over val_loader and return averaged metrics.
 
@@ -56,26 +57,25 @@ def _validate(
     # autoregressive decoder so EM/F1 reflect real inference behaviour rather
     # than teacher-forced argmax at the ground-truth length.
     #
-    # The data layer appends [SEP] (sep_token_id) as the end-of-answer marker
-    # (see squad_dataset.py), so generation must stop on [SEP]. A BERT
-    # tokenizer has no eos_token (eos_token_id is None), so reading
-    # eos_token_id would disable early stopping entirely — generation would
-    # emit all max_answer_len tokens and the trailing junk after [SEP] drives
-    # EM/F1 to ~0. Prefer sep_token_id, fall back to eos_token_id.
+    # The decoder target (dec_answer_ids) appends the decoder tokenizer's EOS as
+    # the end-of-answer marker (see make_decoder_target), so generation must stop
+    # on that EOS. Use the DECODER tokenizer for both stopping and detokenization.
     eos_token_id = None
-    if tokenizer is not None:
-        eos_token_id = getattr(tokenizer, "sep_token_id", None)
-        if eos_token_id is None:
-            eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    gen_max_len = vae.config.max_answer_len
+    if dec_tokenizer is not None:
+        eos_token_id = getattr(dec_tokenizer, "eos_token_id", None)
+    gen_max_len = vae.config.decoder.max_answer_len
 
     with torch.no_grad():
         for batch in val_loader:
             answer_ids = batch["answer_ids"].to(device)
             answer_mask = batch["answer_mask"].to(device)
+            dec_ids = batch["dec_answer_ids"].to(device)
+            dec_mask = batch["dec_answer_mask"].to(device)
             logits, _, mu, log_var, loss_dict = vae(
                 answer_ids,
                 answer_mask,
+                dec_ids,
+                dec_mask,
                 beta=beta,
                 free_bits=free_bits,
                 target_kl=target_kl,
@@ -105,13 +105,13 @@ def _validate(
                 )
 
                 for i in range(pred_ids.size(0)):
-                    pred_text = tokenizer.decode(
+                    pred_text = dec_tokenizer.decode(
                         pred_ids[i].tolist(), skip_special_tokens=True
                     ).strip()
                     all_preds.append(pred_text)
                     all_refs.append(batch["all_answer_texts"][i])
                     all_preds_shuf.append(
-                        tokenizer.decode(
+                        dec_tokenizer.decode(
                             pred_ids_shuf[i].tolist(), skip_special_tokens=True
                         ).strip()
                     )
@@ -204,6 +204,8 @@ def train_vae(
     # ------------------------------------------------------------------ data
     from src.data.tokenization import create_tokenizer
 
+    from src.data.tokenization import create_decoder_tokenizer
+
     if train_loader is None or val_loader is None:
         from src.data.loaders import create_vae_dataloaders
 
@@ -221,49 +223,41 @@ def train_vae(
     else:
         tokenizer = create_tokenizer(config.encoder.model_name)
 
+    # Decoder (causal-LM) tokenizer — drives the reconstruction target and the
+    # detokenization of generated ids during validation.
+    dec_tokenizer = create_decoder_tokenizer(config.decoder.model_name)
+
     # ------------------------------------------------------------------ model
-    # Use the same tokenizer that the data loaders use so vocab_size includes
-    # the [NULL_ANS] special token added by create_tokenizer.
+    # Encoder-tokenizer vocab size (includes [NULL_ANS]); the frozen encoder's
+    # input embeddings are resized to this inside VAEEncoder.
     vocab_size = len(tokenizer)
 
-    # Load real pretrained embeddings from the encoder model (e.g. BERT).
-    # Random init forces the VAE to relearn the vocabulary subspace from
-    # scratch and is a major cause of poor reconstruction.
-    from src.utils.pretrained_embeddings import load_pretrained_token_embeddings
-
-    pretrained_emb = load_pretrained_token_embeddings(
-        model_name=config.encoder.model_name,
-        target_vocab_size=vocab_size,
-        target_embed_dim=config.vae_arch.embed_dim,
-    ).to(device)
-
-    vae = SequenceVAE(config.vae_arch, pretrained_embeddings=pretrained_emb).to(device)
+    vae = SequenceVAE(config, encoder_vocab_size=vocab_size).to(device)
 
     tc = config.vae_training
 
     # Token id used to corrupt teacher-forced decoder inputs for word dropout.
-    # Prefer [MASK]; fall back to [UNK] (both exist in BERT) so the feature is
-    # never silently disabled by a missing id.
-    word_dropout_id = getattr(tokenizer, "mask_token_id", None)
+    # This is the DECODER tokenizer's id (the corrupted inputs are decoder
+    # tokens). Prefer [MASK]/[UNK]; fall back to the pad/eos id (GPT-2 has no
+    # mask token) so the feature is never silently disabled.
+    word_dropout_id = getattr(dec_tokenizer, "mask_token_id", None)
     if word_dropout_id is None:
-        word_dropout_id = getattr(tokenizer, "unk_token_id", None)
+        word_dropout_id = getattr(dec_tokenizer, "unk_token_id", None)
+    if word_dropout_id is None:
+        word_dropout_id = getattr(dec_tokenizer, "eos_token_id", None)
     if tc.word_dropout > 0.0 and word_dropout_id is None:
         logger.warning(
             "word_dropout=%.2f requested but tokenizer has no mask/unk token id; "
             "word dropout will be inactive.", tc.word_dropout,
         )
 
-    # Separate weight decay groups: exclude biases, log_tau, and the
-    # variational heads. Biases shouldn't be decayed (standard practice) and
-    # log_tau needs to grow freely. Critically, ``mu_head``/``logvar_head``
-    # are EXCLUDED: weight decay on them pulls their weights toward zero, which
-    # drives μ→0 and log_var→0, i.e. q(z|x)→N(0,I). When the decoder isn't yet
-    # using z, that decay is the dominant force and it actively collapses the
-    # posterior (true_kl observed crashing to ~0 with all dims dead). Removing
-    # decay here lets reconstruction + BoW gradients decide the posterior.
-    # output_head.linear.weight stays in the decay group (tied to the embedding,
-    # kept bounded).
-    _no_decay = {"bias", "log_tau", "mu_head", "logvar_head"}
+    # Separate weight-decay groups (only TRAINABLE params reach the optimizer;
+    # the frozen pretrained backbones are excluded via ``p.requires_grad``).
+    # Exclude biases (standard) and the variational heads ``mu_head``/
+    # ``logvar_head``: weight decay on them pulls weights toward zero, driving
+    # μ→0 and log_var→0 (q(z|x)→N(0,I)) — a force toward posterior collapse.
+    # Letting reconstruction gradients decide the posterior instead.
+    _no_decay = {"bias", "mu_head", "logvar_head"}
     param_groups = [
         {
             "params": [
@@ -342,6 +336,8 @@ def train_vae(
             epoch_steps += 1
             answer_ids = batch["answer_ids"].to(device)
             answer_mask = batch["answer_mask"].to(device)
+            dec_ids = batch["dec_answer_ids"].to(device)
+            dec_mask = batch["dec_answer_mask"].to(device)
 
             if tc.beta_schedule == "cyclical":
                 beta = compute_cyclical_beta(
@@ -388,6 +384,8 @@ def train_vae(
             logits, z, mu, log_var, loss_dict = vae(
                 answer_ids,
                 answer_mask,
+                dec_ids,
+                dec_mask,
                 beta=beta,
                 free_bits=tc.free_bits,
                 target_kl=tc.target_kl,
@@ -499,6 +497,7 @@ def train_vae(
                     target_kl=tc.target_kl,
                     bow_weight=tc.bow_loss_weight,
                     tokenizer=tokenizer,
+                    dec_tokenizer=dec_tokenizer,
                 )
                 ema.restore()
                 # Pull decoded samples out of the metrics dict and log them as a
@@ -611,6 +610,7 @@ def train_vae(
             beta=tc.beta_end, free_bits=tc.free_bits,
             target_kl=tc.target_kl, bow_weight=tc.bow_loss_weight,
             tokenizer=tokenizer,
+            dec_tokenizer=dec_tokenizer,
         )
         ema.restore()
         final_metrics.pop("_samples", None)

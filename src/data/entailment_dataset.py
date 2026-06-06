@@ -21,7 +21,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerFast
 
-from src.data.squad_dataset import _tokenize_and_pad
+from src.data.squad_dataset import _tokenize_and_pad, make_decoder_target
 
 # HF mirror of EntailmentBank and the field holding explanatory sentences.
 _HF_NAME = "nguyen-brat/entailment_bank"
@@ -78,12 +78,16 @@ class EntailmentBankDataset(Dataset):
         max_answer_len: int,
         max_context_len: int,
         max_question_len: int,
+        decoder_tokenizer: PreTrainedTokenizerFast | None = None,
+        dec_max_answer_len: int | None = None,
     ) -> None:
         self.sentences = sentences
         self.tokenizer = tokenizer
         self.max_answer_len = max_answer_len
         self.max_context_len = max_context_len
         self.max_question_len = max_question_len
+        self.decoder_tokenizer = decoder_tokenizer
+        self.dec_max_answer_len = dec_max_answer_len or max_answer_len
 
     def __len__(self) -> int:
         return len(self.sentences)
@@ -112,7 +116,7 @@ class EntailmentBankDataset(Dataset):
                 answer_ids[real_len] = int(sep_id)
                 answer_mask[real_len] = 1
 
-        return {
+        item = {
             "context_ids": context_ids,
             "context_mask": context_mask,
             "question_ids": question_ids,
@@ -124,3 +128,12 @@ class EntailmentBankDataset(Dataset):
             "answer_text": sentence,
             "all_answer_texts": [sentence],
         }
+
+        if self.decoder_tokenizer is not None:
+            dec_ids, dec_mask = make_decoder_target(
+                self.decoder_tokenizer, sentence, self.dec_max_answer_len
+            )
+            item["dec_answer_ids"] = dec_ids
+            item["dec_answer_mask"] = dec_mask
+
+        return item

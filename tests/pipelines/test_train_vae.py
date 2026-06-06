@@ -42,33 +42,26 @@ def _make_fake_loader(config: Config, n_batches: int = 4) -> DataLoader:
 
     def _collate(batch):
         ids, mask, ans = zip(*batch)
+        ids_t, mask_t = torch.stack(ids), torch.stack(mask)
         return {
-            "answer_ids": torch.stack(ids),
-            "answer_mask": torch.stack(mask),
+            "answer_ids": ids_t,
+            "answer_mask": mask_t,
+            # Decoder-vocab target — reuse the same tiny ids/mask (fake VAE uses
+            # the same vocab for encoder and decoder sides).
+            "dec_answer_ids": ids_t,
+            "dec_answer_mask": mask_t,
             "is_answerable": torch.stack(ans),
+            "all_answer_texts": [["x"] for _ in range(len(ids))],
         }
 
     return DataLoader(ds, batch_size=B, collate_fn=_collate, drop_last=True)
 
 
 def _make_tiny_vae(config: Config) -> nn.Module:
-    """Build a SequenceVAE with tiny random embeddings (no BERT)."""
-    from src.models.vae.vae import SequenceVAE
+    """Synthetic fake VAE (no BERT/GPT-2) implementing the new interface."""
+    from tests.conftest import make_fake_vae
 
-    V = 100
-    pretrained_emb = torch.randn(V, config.vae_arch.embed_dim) * 0.02
-    return SequenceVAE(config.vae_arch, pretrained_embeddings=pretrained_emb)
-
-
-def _patch_pretrained_loader(monkeypatch) -> None:
-    """Bypass the real BERT embedding loader so tiny test configs don't trip
-    the embed_dim sanity check (BERT is 768-d; tests use 64-d)."""
-    import src.utils.pretrained_embeddings as pe_mod
-
-    def _fake_loader(model_name, target_vocab_size, target_embed_dim):
-        return torch.randn(target_vocab_size, target_embed_dim) * 0.02
-
-    monkeypatch.setattr(pe_mod, "load_pretrained_token_embeddings", _fake_loader)
+    return make_fake_vae(config)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +71,6 @@ def _patch_pretrained_loader(monkeypatch) -> None:
 
 def test_one_epoch_runs(tiny_config: Config, monkeypatch):
     """Training for 2 steps should complete without raising."""
-    _patch_pretrained_loader(monkeypatch)
     tc = tiny_config.vae_training
     from dataclasses import replace as _replace
 
@@ -96,7 +88,7 @@ def test_one_epoch_runs(tiny_config: Config, monkeypatch):
     vae_instance = _make_tiny_vae(cfg)
 
     class _FakeVAECls:
-        def __new__(cls, arch_cfg, pretrained_embeddings=None):
+        def __new__(cls, config, encoder_vocab_size=None):
             return vae_instance
 
     old_cls = tv_mod.SequenceVAE
@@ -114,7 +106,6 @@ def test_one_epoch_runs(tiny_config: Config, monkeypatch):
 
 def test_loss_decreases(tiny_config: Config, monkeypatch):
     """Training for 20 steps on the same batch should reduce loss."""
-    _patch_pretrained_loader(monkeypatch)
     from dataclasses import replace as _replace
 
     new_tc = _replace(
@@ -151,10 +142,14 @@ def test_loss_decreases(tiny_config: Config, monkeypatch):
 
     def _collate(batch):
         ids, mask, ans = zip(*batch)
+        ids_t, mask_t = torch.stack(ids), torch.stack(mask)
         return {
-            "answer_ids": torch.stack(ids),
-            "answer_mask": torch.stack(mask),
+            "answer_ids": ids_t,
+            "answer_mask": mask_t,
+            "dec_answer_ids": ids_t,
+            "dec_answer_mask": mask_t,
             "is_answerable": torch.stack(ans),
+            "all_answer_texts": [["x"] for _ in range(len(ids))],
         }
 
     train_loader = DataLoader(
@@ -170,7 +165,7 @@ def test_loss_decreases(tiny_config: Config, monkeypatch):
     vae_instance = _make_tiny_vae(cfg)
 
     class _FakeVAECls:
-        def __new__(cls, arch_cfg, pretrained_embeddings=None):
+        def __new__(cls, config, encoder_vocab_size=None):
             return vae_instance
 
     old_cls = tv_mod.SequenceVAE

@@ -60,9 +60,12 @@ def _make_fake_loader(config: Config, n: int = 4) -> DataLoader:
 
     def _collate(items):
         ids, mask, ans = zip(*items)
+        ids_t, mask_t = torch.stack(ids), torch.stack(mask)
         return {
-            "answer_ids": torch.stack(ids),
-            "answer_mask": torch.stack(mask),
+            "answer_ids": ids_t,
+            "answer_mask": mask_t,
+            "dec_answer_ids": ids_t,
+            "dec_answer_mask": mask_t,
             "is_answerable": torch.stack(ans),
         }
 
@@ -70,12 +73,10 @@ def _make_fake_loader(config: Config, n: int = 4) -> DataLoader:
 
 
 def _make_vae(config: Config) -> nn.Module:
-    """SequenceVAE with tiny random embeddings (no BERT)."""
-    from src.models.vae.vae import SequenceVAE
+    """Synthetic fake VAE (no BERT/GPT-2) implementing the new interface."""
+    from tests.conftest import make_fake_vae
 
-    V = 100
-    emb = torch.randn(V, config.vae_arch.embed_dim) * 0.02
-    return SequenceVAE(config.vae_arch, pretrained_embeddings=emb)
+    return make_fake_vae(config)
 
 
 # ---------------------------------------------------------------------------

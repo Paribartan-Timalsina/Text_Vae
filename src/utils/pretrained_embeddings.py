@@ -15,6 +15,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def load_pretrained_encoder_model(model_name: str, freeze: bool = True):
+    """Load a pretrained ``AutoModel`` (e.g. BERT) for use as a frozen encoder.
+
+    Returns the HuggingFace model in eval mode with ``requires_grad_(False)``
+    when *freeze* is True. The VAE encoder runs the answer through this frozen
+    backbone and only trains the Perceiver pool + variational heads on top —
+    the LangVAE approach. The model's input embeddings are resized lazily by the
+    caller (``resize_token_embeddings``) to cover added special tokens like
+    ``[NULL_ANS]``.
+    """
+    from transformers import AutoModel
+
+    model = AutoModel.from_pretrained(model_name)
+    if freeze:
+        model.eval()
+        model.requires_grad_(False)
+    return model
+
+
 def load_pretrained_token_embeddings(
     model_name: str,
     target_vocab_size: int,

@@ -32,6 +32,27 @@ def create_tokenizer(model_name: str) -> PreTrainedTokenizerFast:
     return tokenizer
 
 
+def create_decoder_tokenizer(model_name: str) -> PreTrainedTokenizerFast:
+    """Load the *decoder* (causal-LM) tokenizer used to tokenize the
+    reconstruction target and to detokenize generated ids.
+
+    This is separate from the encoder tokenizer: the encoder reads the answer in
+    BERT's vocabulary, while the decoder generates in its own (e.g. GPT-2 BPE).
+    Two adjustments are needed for GPT-2-family models:
+
+    * GPT-2 has no pad token — set ``pad_token = eos_token`` so batched
+      teacher-forced inputs can be padded. Padding is masked out of the loss.
+    * ``add_prefix_space=True`` so a leading word is tokenized the same whether
+      or not it follows a space — this keeps SQuAD answers round-tripping
+      cleanly (matches LangVAE's decoder tokenizer setup).
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_name, add_prefix_space=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    return tokenizer
+
+
 def get_null_token_id(tokenizer: PreTrainedTokenizerFast) -> int:
     """Return the integer ID of the ``[NULL_ANS]`` token.
 

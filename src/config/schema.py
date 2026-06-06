@@ -28,6 +28,30 @@ class EncoderConfig:
 
 
 @dataclass(frozen=True)
+class DecoderConfig:
+    """Frozen pretrained causal-LM decoder settings (LangVAE-style backbone).
+
+    The decoder is a pretrained ``AutoModelForCausalLM`` (e.g. GPT-2) whose
+    weights are FROZEN by default — only the latent-injection projections (and,
+    if ``use_lora``, small LoRA adapters) are trained. This is the architectural
+    fix for the from-scratch-decoder gibberish: a pretrained LM already produces
+    fluent text, so the VAE only has to learn to read/write the latent.
+    """
+
+    model_name: str = "gpt2"  # HuggingFace causal-LM id used as the generator.
+    max_answer_len: int = 50  # Max decoder tokens (reconstruction length).
+    latent_pos_inject: bool = True  # Add a K-pooled projection of z to EVERY
+    # decoder token embedding (not just the K-token prefix). Keeps z reachable at
+    # every step so the frozen decoder cannot ignore it.
+    use_lora: bool = False  # Attach LoRA adapters to the decoder (the "beat
+    # LangVAE" lever — relaxes its frozen-decoder convergence limitation at <1%
+    # trainable params). OFF by default; the architecture fix does not need it.
+    lora_r: int = 16  # LoRA rank.
+    lora_alpha: int = 32  # LoRA scaling.
+    lora_dropout: float = 0.05  # LoRA dropout.
+
+
+@dataclass(frozen=True)
 class VAEArchConfig:
     """VAE architecture hyperparameters."""
 
@@ -147,6 +171,7 @@ class Config:
     seed: int = 42  # Global random seed
     paths: PathConfig = field(default_factory=PathConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    decoder: DecoderConfig = field(default_factory=DecoderConfig)
     vae_arch: VAEArchConfig = field(default_factory=VAEArchConfig)
     vae_training: VAETrainingConfig = field(default_factory=VAETrainingConfig)
     quality_gate: QualityGateConfig = field(default_factory=QualityGateConfig)
@@ -170,6 +195,7 @@ class Config:
             seed=d.get("seed", 42),
             paths=PathConfig(**_checked(PathConfig, d.get("paths", {}))),
             encoder=EncoderConfig(**_checked(EncoderConfig, d.get("encoder", {}))),
+            decoder=DecoderConfig(**_checked(DecoderConfig, d.get("decoder", {}))),
             vae_arch=VAEArchConfig(**_checked(VAEArchConfig, d.get("vae_arch", {}))),
             vae_training=VAETrainingConfig(
                 **_checked(VAETrainingConfig, d.get("vae_training", {}))
