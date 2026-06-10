@@ -13,7 +13,10 @@ vae_arch:
   num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
   dropout: 0.1 # Dropout for the Perceiver pool.
   max_answer_len: 50 # Max answer length on the ENCODER (BERT) side.
-  num_latent_tokens: 4 # K latent tokens — the "sequence latent" contribution.
+  num_latent_tokens: 16 # K latent tokens — the "sequence latent" contribution.
+  # 4→16: K*D = 16*128 = 2048 latent dims. BLEU ~90 needs near-lossless encoding
+  # of up to 50 tokens; K=4 (512 dims, KL-squeezed to ~22 nats) was the
+  # information bottleneck behind BLEU ~20.
   # Ablate K=1 to compare directly against LangVAE's single latent vector.
   latent_pos_inject: true # (Kept for compat; the decoder reads decoder.latent_pos_inject.)
   use_bow_head: false # BoW anti-collapse head — OFF (a frozen pretrained decoder
@@ -30,9 +33,13 @@ decoder:
   # path to learn to READ the injected latent, so it bypasses z and generates
   # from its prior (fluent but unrelated text, val/f1_gap≈0.03). LoRA gives it
   # that path — the primary cure for strong-decoder latent bypass. <1% params.
-  lora_r: 16
-  lora_alpha: 32
+  lora_r: 32 # 16→32 + MLP targets (c_fc/c_proj): more trainable capacity to
+  # integrate the much larger deep-injected latent signal.
+  lora_alpha: 64
   lora_dropout: 0.05
+  deep_inject: true # Per-layer KV injection (Optimus/LangVAE style): K latent
+  # memory slots in EVERY decoder layer's attention, on top of the input prefix.
+  # ~12× the z→decoder bandwidth — the main architectural lever for BLEU ~90.
 
 vae_training:
   dataset: squad_v2 # "squad_v2" (short answers, has NULLs) or "entailment_bank"
@@ -46,36 +53,50 @@ vae_training:
   weight_decay: 0.01 # AdamW weight decay (applies to trained heads only).
   grad_clip_max_norm: 1.0 # Far fewer trainable params now — 1.0 is fine.
   grad_accum_steps: 1
-  beta_start: 0.0 # KL weight at the start of each cycle.
-  beta_end: 1.0 # Max KL weight (paper max_beta=1.0). Safe now: the frozen
-  # pretrained decoder does not collapse like the from-scratch one.
-  beta_warmup_steps: 10000 # (monotonic schedule only)
-  beta_schedule: cyclical # Cyclical KL annealing (Fu et al. 2019), as in LangVAE.
-  beta_cycles: 40 # Paper §5.1: 40 beta annealing cycles.
-  beta_cycle_ratio: 0.5 # Fraction of each cycle spent ramping.
-  free_bits: 0.0 # OFF — the 32-nat free-bits floor was a from-scratch prop.
+  # --- KL regime: near-autoencoder (latent-diffusion recipe) ---
+  # Goal is high-fidelity reconstruction (BLEU ~90): the latent must carry
+  # hundreds of nats, so KL pressure is tiny — like Stable Diffusion's VAE
+  # (KL weight ~1e-4..1e-2). The downstream diffusion model learns the prior;
+  # exported latents are normalized via normalization_stats.pt, so a non-smooth
+  # N(0,I) fit is acceptable. The old regime (beta_end=1.0, target_kl=2.0)
+  # squeezed val/true_kl to ~22 nats ≈ 32 bits — mathematically too little to
+  # pin down a 50-token sentence; that was the BLEU ~20 ceiling.
+  # NOTE: prior-sampling quality (decode z ~ N(0,I)) is traded away here.
+  beta_start: 0.0 # KL weight at the start of warmup.
+  beta_end: 0.05 # Max KL weight. Tiny on purpose — see regime note above.
+  beta_warmup_steps: 5000 # (monotonic schedule only)
+  beta_schedule: monotonic # Cyclical annealing was an anti-collapse measure;
+  # at beta 0.05 there is no collapse pressure to fight, and a stable beta
+  # gives smoother training than 40 squeeze/release cycles.
+  beta_cycles: 40 # (unused with monotonic)
+  beta_cycle_ratio: 0.5 # (unused with monotonic)
+  free_bits: 0.0 # OFF — no collapse pressure at beta 0.05, nothing to floor.
   ema_decay: 0.999
-  target_kl: 2.0 # Paper §5.1: target_kl=2.0 (soft hinge — penalise only KL above
-  # this). The principled collapse control here, instead of free_bits.
+  target_kl: null # OFF. The 2.0-nat hinge was the fidelity bottleneck: it
+  # actively pushed the latent back toward ~2 nats of information.
   val_every_n_steps: 500
   noise_aug_sigma: 0.0 # Diffusion-time robustness; enable (~0.1) only after f1_gap
   # confirms z is used.
   noise_aug_prob: 0.0
   null_train_fraction: 0.10 # Keep 10% NULL / 90% answerable in VAE training (SQuAD).
   null_loss_weight: 0.1 # Downweight NULL reconstruction loss.
-  word_dropout: 0.5 # Replace 50% of teacher-forced decoder INPUT tokens with a
-  # RANDOM token (Bowman 2016). Removes the teacher-forcing crutch so the decoder
-  # must read z to predict tokens 2…N, not just the first — anti-bypass cure for
-  # the strong frozen decoder. (GPT-2 has no [MASK]; decoder.py uses random ids.)
+  word_dropout: 0.2 # Replace 20% of teacher-forced decoder INPUT tokens with a
+  # RANDOM token (Bowman 2016). 0.5→0.2: with deep injection + near-AE KL the
+  # decoder has no incentive to bypass z (free-running eval self-enforces
+  # z-usage); keep a light dose for exposure robustness only. Heavy dropout
+  # spends model capacity on noise robustness and costs reconstruction BLEU.
   bow_loss_weight: 0.0 # OFF (reserve lever; requires use_bow_head).
-  zforce_weight: 1.0 # Second decode with word_dropout=1.0 (ALL inputs corrupted)
-  # so the decoder reconstructs from the z-prefix ALONE — generation-like
-  # conditions, directly training z-usage. The other half of the anti-bypass cure.
+  zforce_weight: 0.3 # Second decode with word_dropout=1.0 (ALL inputs corrupted)
+  # so the decoder reconstructs from the z-prefix ALONE. 1.0→0.3: demoted from
+  # primary anti-bypass cure to regularizer — useful gradient signal for the
+  # generation-like condition, but no longer allowed to dominate the
+  # teacher-forced reconstruction term that drives fidelity.
 
 quality_gate:
   min_recon_accuracy: 0.85 # Min token-level reconstruction accuracy
-  min_mean_kl: 1.0 # Min mean KL to avoid posterior collapse (K=4 sequence latent)
-  min_active_dims: 16 # Min latent dims with variance > threshold (~3% of K*D = 4*128 = 512)
+  min_mean_kl: 1.0 # Min mean KL to avoid posterior collapse (trivially passed
+  # in the near-AE regime — KL should sit in the hundreds of nats)
+  min_active_dims: 64 # Min latent dims with variance > threshold (~3% of K*D = 16*128 = 2048)
   min_centroid_distance: 0.5 # Min L2 between answerable/unanswerable centroids
   active_dim_variance_threshold: 0.1 # Variance cutoff for "active" dimension
   max_dead_slots: 0 # Max latent slots with zero active dims (per-slot collapse)

@@ -26,9 +26,23 @@ def _lora_target_modules(model_name: str) -> list[str]:
     """Reasonable default LoRA target modules per decoder family."""
     name = model_name.lower()
     if "gpt2" in name or "gpt-2" in name:
-        return ["c_attn"]
+        # Attention QKV + output proj + MLP (c_proj matches both attn.c_proj
+        # and mlp.c_proj). Wider coverage than attention-only so the decoder
+        # has enough trainable capacity to integrate the injected latent.
+        return ["c_attn", "c_proj", "c_fc"]
     # Llama/Qwen/Mistral-style projection names.
     return ["q_proj", "v_proj"]
+
+
+def _build_cache(layers: tuple) -> object:
+    """Wrap legacy ``((k, v), ...)`` layers in a ``Cache`` object when the
+    installed transformers requires it; fall back to the raw tuple."""
+    try:
+        from transformers import DynamicCache
+
+        return DynamicCache.from_legacy_cache(layers)
+    except (ImportError, AttributeError):
+        return layers
 
 
 class VAEDecoder(nn.Module):
@@ -50,6 +64,7 @@ class VAEDecoder(nn.Module):
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
+        deep_inject: bool = False,
     ) -> None:
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -93,6 +108,23 @@ class VAEDecoder(nn.Module):
         else:
             self.latent_context_proj = None
 
+        # Deep injection (Optimus / LangVAE KV-cache style): project each of
+        # the K latent tokens into a key/value memory slot in EVERY decoder
+        # layer's attention, via past_key_values. Every layer at every position
+        # can then attend directly into z — ~n_layer× the bandwidth of the
+        # input-layer prefix alone, the main lever for reconstruction fidelity.
+        if deep_inject:
+            self.n_layer = getattr(cfg, "n_layer", None) or cfg.num_hidden_layers
+            n_head = getattr(cfg, "n_head", None) or cfg.num_attention_heads
+            n_kv_head = getattr(cfg, "num_key_value_heads", None) or n_head
+            self.n_kv_head = n_kv_head
+            self.kv_head_dim = self.hidden // n_head
+            self.kv_proj = nn.Linear(
+                latent_dim, self.n_layer * 2 * n_kv_head * self.kv_head_dim
+            )
+        else:
+            self.kv_proj = None
+
     # ------------------------------------------------------------------
     def _input_embeddings(self) -> nn.Module:
         return self.lm.get_input_embeddings()
@@ -110,6 +142,24 @@ class VAEDecoder(nn.Module):
         if self.latent_context_proj is None:
             return None
         return self.latent_context_proj(z.mean(dim=1, keepdim=True))  # (B, 1, H)
+
+    def _past_kv(self, z: torch.Tensor) -> object | None:
+        """``(B, K, latent_dim)`` → per-layer K-slot key/value memory.
+
+        Returns a fresh cache each call (``Cache.update`` mutates, so it cannot
+        be reused across forward passes), or ``None`` when deep injection is off.
+        """
+        if self.kv_proj is None:
+            return None
+        B, K, _ = z.shape
+        kv = self.kv_proj(z)  # (B, K, n_layer * 2 * n_kv_head * head_dim)
+        kv = kv.view(B, K, self.n_layer, 2, self.n_kv_head, self.kv_head_dim)
+        kv = kv.permute(2, 3, 0, 4, 1, 5)  # (n_layer, 2, B, n_kv_head, K, hd)
+        layers = tuple(
+            (kv[layer][0].contiguous(), kv[layer][1].contiguous())
+            for layer in range(self.n_layer)
+        )
+        return _build_cache(layers)
 
     # ------------------------------------------------------------------ training
     def forward(
@@ -155,7 +205,18 @@ class VAEDecoder(nn.Module):
         attn = torch.cat(
             [torch.ones(B, K, dtype=mask.dtype, device=mask.device), mask], dim=1
         )
-        out = self.lm(inputs_embeds=inputs_embeds, attention_mask=attn, use_cache=False)
+        past = self._past_kv(z)
+        if past is not None:
+            # K extra always-visible memory slots per layer; extend the mask.
+            attn = torch.cat(
+                [torch.ones(B, K, dtype=mask.dtype, device=mask.device), attn], dim=1
+            )
+        out = self.lm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attn,
+            past_key_values=past,
+            use_cache=past is not None,
+        )
         logits = out.logits  # (B, K+L, V)
         # Position K-1 (last prefix token) predicts token 0; position K+i-1
         # predicts token i. Slice the L positions that predict tokens 0..L-1.
@@ -198,8 +259,17 @@ class VAEDecoder(nn.Module):
                 if ctx is not None:
                     tok_emb = tok_emb + ctx
                 inp = torch.cat([prefix, tok_emb], dim=1)  # (B, K+t, H)
-            attn = torch.ones(inp.size(0), inp.size(1), dtype=torch.long, device=device)
-            out = self.lm(inputs_embeds=inp, attention_mask=attn, use_cache=False)
+            # Fresh cache each step (Cache.update mutates) — mirrors forward(),
+            # where the K memory slots always precede the recomputed sequence.
+            past = self._past_kv(z)
+            attn_len = inp.size(1) + (self.num_latent_tokens if past is not None else 0)
+            attn = torch.ones(inp.size(0), attn_len, dtype=torch.long, device=device)
+            out = self.lm(
+                inputs_embeds=inp,
+                attention_mask=attn,
+                past_key_values=past,
+                use_cache=past is not None,
+            )
             logits = out.logits[:, -1, :]
 
             next_id = self._sample(logits, strategy, temperature, top_p)
@@ -218,7 +288,6 @@ class VAEDecoder(nn.Module):
 
             nxt = next_id.unsqueeze(1)
             cur_ids = nxt if cur_ids is None else torch.cat([cur_ids, nxt], dim=1)
-            logits = out.logits[:, -1, :]
 
         return torch.stack(generated, dim=1)  # (B, max_len)
 

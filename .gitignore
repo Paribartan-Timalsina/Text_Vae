@@ -3,3 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.pyc
+
+# Environments
+.venv/
+
+# Run outputs
+checkpoints/
+latents/
+outputs/
+wandb/

@@ -54,6 +54,7 @@ class SequenceVAE(nn.Module):
             lora_r=config.decoder.lora_r,
             lora_alpha=config.decoder.lora_alpha,
             lora_dropout=config.decoder.lora_dropout,
+            deep_inject=config.decoder.deep_inject,
         )
 
         # Optional bag-of-words head over the DECODER vocabulary, predicted from

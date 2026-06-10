@@ -50,6 +50,11 @@ class DecoderConfig:
     lora_r: int = 16  # LoRA rank.
     lora_alpha: int = 32  # LoRA scaling.
     lora_dropout: float = 0.05  # LoRA dropout.
+    deep_inject: bool = True  # Per-layer KV injection (Optimus/LangVAE-style):
+    # project the K latent tokens into K key/value memory slots in EVERY decoder
+    # layer's attention (past_key_values), in addition to the input-layer prefix.
+    # Raises the z→decoder bandwidth by ~n_layer×, the main lever for high-
+    # fidelity reconstruction (BLEU). False = input-layer prefix + context only.
 
 
 @dataclass(frozen=True)
