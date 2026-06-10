@@ -9,7 +9,6 @@ vae_arch:
   latent_dim: 128 # Per-token latent dimensionality.
   embed_dim: 768 # (Unused by the frozen backbones; kept for config compat.)
   num_layers: 4 # (Unused — encoder is a frozen pretrained backbone now.)
-  decoder_num_layers: 2 # (Unused — decoder is a frozen pretrained LM now.)
   num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
   dropout: 0.1 # Dropout for the Perceiver pool.
   max_answer_len: 50 # Max answer length on the ENCODER (BERT) side.
@@ -51,7 +50,9 @@ vae_training:
   patience: 10 # Early-stopping patience (val checks).
   warmup_steps: 500 # LR warmup steps.
   weight_decay: 0.01 # AdamW weight decay (applies to trained heads only).
-  grad_clip_max_norm: 1.0 # Far fewer trainable params now — 1.0 is fine.
+  grad_clip_max_norm: 5.0 # 1.0 clipped a ~38 pre-clip grad_norm ~38x → effective
+  # LR throttled, convergence crawled. 5.0 lets gradients through while still
+  # catching spikes.
   grad_accum_steps: 1
   # --- KL regime: near-autoencoder (latent-diffusion recipe) ---
   # Goal is high-fidelity reconstruction (BLEU ~90): the latent must carry
@@ -63,7 +64,13 @@ vae_training:
   # pin down a 50-token sentence; that was the BLEU ~20 ceiling.
   # NOTE: prior-sampling quality (decode z ~ N(0,I)) is traded away here.
   beta_start: 0.0 # KL weight at the start of warmup.
-  beta_end: 0.05 # Max KL weight. Tiny on purpose — see regime note above.
+  beta_end: 0.01 # Max KL weight. 0.05→0.01: at 0.05 the posterior kept nonzero
+  # std (latent/std_mean ~0.84) so eval-time z=mu lost the noised-away low-
+  # redundancy bits — content-word substitutions ("Tuna"→"Toad", "cold water"→
+  # "water") capped EM ~35 / BLEU ~70 while the sentence skeleton reconstructed
+  # perfectly. 10x less KL pressure = more bits for rare/content tokens. Watch
+  # val/f1_gap (must hold — it is the collapse guard) and latent/std_mean
+  # (should fall toward ~0.1 as the posterior sharpens).
   beta_warmup_steps: 5000 # (monotonic schedule only)
   beta_schedule: monotonic # Cyclical annealing was an anti-collapse measure;
   # at beta 0.05 there is no collapse pressure to fight, and a stable beta

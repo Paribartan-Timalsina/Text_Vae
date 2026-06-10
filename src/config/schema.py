@@ -47,8 +47,8 @@ class DecoderConfig:
     # decoder has no trainable path to learn to read the injected latent and so
     # bypasses z (fluent but unconditioned output); LoRA gives it that path — the
     # primary cure for strong-decoder latent bypass. <1% trainable params.
-    lora_r: int = 16  # LoRA rank.
-    lora_alpha: int = 32  # LoRA scaling.
+    lora_r: int = 32  # LoRA rank.
+    lora_alpha: int = 64  # LoRA scaling.
     lora_dropout: float = 0.05  # LoRA dropout.
     deep_inject: bool = True  # Per-layer KV injection (Optimus/LangVAE-style):
     # project the K latent tokens into K key/value memory slots in EVERY decoder
@@ -61,26 +61,23 @@ class DecoderConfig:
 class VAEArchConfig:
     """VAE architecture hyperparameters."""
 
-    latent_dim: int = 128  # Latent space dimensionality
-    embed_dim: int = 768  # Internal embedding dimension
-    num_layers: int = 4  # Transformer layers in the ENCODER (and decoder when
-    # ``decoder_num_layers`` is None)
-    decoder_num_layers: Optional[int] = None  # Transformer layers in the DECODER.
-    # None falls back to ``num_layers``. Set BELOW num_layers (e.g. encoder 4 /
-    # decoder 2) to deliberately weaken the autoregressive decoder so it cannot
-    # model p(answer) from teacher-forced tokens alone and is forced to read z —
-    # the cure for powerful-decoder latent bypass (high free_bits-propped KL but
-    # generation collapses to NULL; val EM/F1 pinned at the null rate).
-    num_heads: int = 8  # Attention heads
-    dropout: float = 0.1  # Dropout rate
-    max_answer_len: int = 50  # Max answer token length
-    num_latent_tokens: int = 4  # Pseudo-tokens for latent KV injection
-    latent_pos_inject: bool = False  # Add a K-pooled projection of z to every
-    # decoder token input (not just the KV prefix). Stops the causal decoder
-    # from bypassing z via teacher forcing — the main posterior-collapse cure.
+    latent_dim: int = 128  # Per-token latent dimensionality.
+    embed_dim: int = 768  # (Unused by the frozen backbones; kept for compat.)
+    num_layers: int = 4  # (Unused — encoder is a frozen pretrained backbone.)
+    decoder_num_layers: Optional[int] = None  # (Unused — decoder is a frozen
+    # pretrained causal LM; depth is fixed by the backbone.)
+    num_heads: int = 8  # Heads for the Perceiver cross-attention pool.
+    dropout: float = 0.1  # Dropout for the Perceiver pool.
+    max_answer_len: int = 50  # Max answer token length (encoder side).
+    num_latent_tokens: int = 16  # K latent tokens (the sequence latent). K*D =
+    # 16*128 = 2048 latent dims — capacity for near-lossless encoding of up to
+    # ~50 tokens. K=4 (512 dims) was the information bottleneck behind BLEU ~20.
+    latent_pos_inject: bool = True  # (Kept for compat; the decoder reads
+    # ``decoder.latent_pos_inject``.)
     use_bow_head: bool = False  # Build a bag-of-words head that predicts the
-    # answer's token set from z alone (Zhao et al. 2017). Trained via
-    # ``vae_training.bow_loss_weight``; forces z to stay informative.
+    # answer's token set from z alone (Zhao et al. 2017). OFF — anti-collapse
+    # reserve lever; not needed in the near-AE regime. Trained via
+    # ``vae_training.bow_loss_weight`` when enabled.
 
 
 @dataclass(frozen=True)
@@ -92,36 +89,37 @@ class VAETrainingConfig:
     # reconstruct EntailmentBank explanatory sentences (full declarative sentences,
     # no NULLs), matching the LangVAE paper (arXiv:2505.00004): all explanatory
     # ("cot") sentences, deduped, 99/1 split, one sentence per example.
-    learning_rate: float = 5e-4  # Peak learning rate (1e-4 was ~10x too low →
-    # recon stuck ~20; 5e-4 lets the decoder learn to read the latent)
-    batch_size: int = 64  # Training batch size
-    epochs: int = 30  # Maximum training epochs
-    patience: int = 5  # Early stopping patience (val checks)
+    learning_rate: float = 1e-3  # AdamW peak LR. Only the small trained heads/
+    # adapters see gradients, so a higher LR than a full-model train is fine.
+    batch_size: int = 50  # Training batch size
+    epochs: int = 50  # Maximum training epochs
+    patience: int = 10  # Early stopping patience (val checks)
     warmup_steps: int = 500  # LR scheduler warmup
     weight_decay: float = 0.01  # AdamW weight decay
-    grad_clip_max_norm: float = 5.0  # Gradient clipping threshold (1.0 throttled
-    # the ~25M-param model's effective LR ~15-20x → underfit; see vae/default.yaml)
+    grad_clip_max_norm: float = 5.0  # Gradient clipping threshold. 1.0 clipped a
+    # ~38 pre-clip grad_norm ~38x → effective LR throttled, convergence crawled.
     grad_accum_steps: int = 1  # Gradient accumulation steps
-    beta_start: float = 0.01  # KL weight at start
-    beta_end: float = 0.5  # KL weight at end. 1.0 crushed the decoder at the
-    # cyclical β peaks — val EM/F1 dipped to 0 exactly when β hit 1.0. Cap at 0.5.
-    beta_warmup_steps: int = 10000  # Steps to ramp beta
-    beta_schedule: str = "cyclical"  # "monotonic" or "cyclical"
-    beta_cycles: int = 40  # Number of cycles (only used with "cyclical")
-    target_kl: Optional[float] = (
-        None  # KL hinge target (None = disabled). With K*D≈512 latent dims a
-        # finite value like 20.0 drives the posterior toward ~0.02 nats/dim,
-        # i.e. near-collapse. Rely on cyclical annealing + free_bits instead.
-    )
-    beta_cycle_ratio: float = 0.5  # Fraction of cycle spent ramping
-    free_bits: float = 0.0625  # Per-dim KL ALLOWANCE the encoder may use penalty-
-    # free (target-rate VAE). 0.02 collapsed (KL pinned at floor before the decoder
-    # learned to read z); 0.3 over-corrected — the floor (K*D*0.3 ≈ 307 over 1024
-    # dims) PROPPED train/kl to ~308 artificially while the powerful decoder bypassed
-    # z entirely (gen → NULL, val EM/F1 stuck at the null rate, true_kl decaying).
-    # 0.0625 over K*D=512 (num_latent_tokens 8→4) floors KL at ~32 nats — a real
-    # target rate, not a prop — now safe because the decoder is also weakened
-    # (decoder_num_layers). Watch train/true_kl AND val EM/F1: KL alive ≠ z used.
+    # --- KL regime: near-autoencoder (latent-diffusion recipe) ---
+    # Goal is high-fidelity reconstruction (BLEU ~90): the latent must carry
+    # hundreds of nats, so KL pressure is tiny — like Stable Diffusion's VAE.
+    # The downstream diffusion model learns the prior; exported latents are
+    # normalized (normalization_stats.pt), so a non-smooth N(0,I) fit is OK.
+    # Prior-sampling quality (decode z ~ N(0,I) directly) is traded away.
+    beta_start: float = 0.0  # KL weight at the start of warmup.
+    beta_end: float = 0.01  # Max KL weight. Tiny on purpose (see regime note).
+    # 0.05 left the posterior std ~0.84 → eval-time z=mu lost low-redundancy bits
+    # → content-word substitutions capped EM ~35 / BLEU ~70. 0.01 gives more bits
+    # for rare/content tokens. Watch val/f1_gap (collapse guard) + latent/std_mean.
+    beta_warmup_steps: int = 5000  # Steps to ramp beta (monotonic schedule).
+    beta_schedule: str = "monotonic"  # "monotonic" or "cyclical". Cyclical was an
+    # anti-collapse measure; at beta 0.01 there is no collapse pressure to cycle.
+    beta_cycles: int = 40  # (unused with monotonic)
+    target_kl: Optional[float] = None  # KL hinge target (None = disabled). A
+    # finite value actively pushes the latent back toward that few-nat budget —
+    # the opposite of what high-fidelity reconstruction needs.
+    beta_cycle_ratio: float = 0.5  # (unused with monotonic)
+    free_bits: float = 0.0  # OFF — no collapse pressure at beta 0.01, nothing to
+    # floor. (Per-dim KL allowance, Kingma 2016; reserve lever only.)
     ema_decay: float = 0.999  # EMA decay rate for validation weights
     val_every_n_steps: int = 500  # Validation frequency (steps)
     noise_aug_sigma: float = 0.0  # Extra Gaussian noise std added to z before
@@ -136,15 +134,17 @@ class VAETrainingConfig:
     # to NULL examples (answerable examples keep weight 1.0). Further rebalances
     # the decoder's gradient toward answer text without removing nulls — they
     # still pass through the encoder so their latents stay structured for export.
-    word_dropout: float = 0.5  # Probability of replacing each teacher-forced
+    word_dropout: float = 0.2  # Probability of replacing each teacher-forced
     # decoder INPUT token with a RANDOM token during training (Bowman et al.
-    # 2016). Removes the teacher-forcing crutch so a strong frozen decoder must
-    # read z to predict tokens 2…N (anti-bypass). 0.0 disables.
+    # 2016). Removes the teacher-forcing crutch so the decoder must read z to
+    # predict tokens 2…N (anti-bypass). 0.5→0.2: with deep injection + near-AE KL
+    # the decoder no longer bypasses z (free-running eval self-enforces z-usage),
+    # so a light dose for exposure robustness only. 0.0 disables.
     bow_loss_weight: float = 0.0  # Weight on the bag-of-words auxiliary loss
     # (requires vae_arch.use_bow_head). Added directly to the total loss like a
     # second reconstruction term; uses the same per-sequence-sum reduction so
     # the weight is comparable to recon. 0.0 disables. ~0.3-1.0 is typical.
-    zforce_weight: float = 1.0  # Weight on the z-forcing auxiliary pass (Goyal
+    zforce_weight: float = 0.3  # Weight on the z-forcing auxiliary pass (Goyal
     # et al. 2017). A SECOND teacher-forced decode of the SAME decoder run with
     # word_dropout=1.0 — every input token is [MASK], so the decoder must
     # reconstruct from z (+ position) ALONE. Trains the deployed decoder under
@@ -160,8 +160,10 @@ class QualityGateConfig:
     """Thresholds for latent quality gate checks."""
 
     min_recon_accuracy: float = 0.85  # Minimum token reconstruction accuracy
-    min_mean_kl: float = 0.1  # Minimum mean KL divergence
-    min_active_dims: int = 10  # Minimum active latent dimensions
+    min_mean_kl: float = 1.0  # Minimum mean KL (trivially passed in the near-AE
+    # regime — KL should sit in the hundreds of nats)
+    min_active_dims: int = 64  # Minimum active latent dimensions (~3% of
+    # K*D = 16*128 = 2048)
     min_centroid_distance: float = 0.5  # Min L2 distance between ans/no-ans centroids
     active_dim_variance_threshold: float = 0.1  # Variance threshold for "active" dim
     max_dead_slots: int = 0  # Max collapsed latent slots (per-slot zero active dims)
