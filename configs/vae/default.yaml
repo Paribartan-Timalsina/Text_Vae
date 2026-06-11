@@ -6,14 +6,14 @@
 # trained. This is the fix for the from-scratch-decoder gibberish — a pretrained
 # LM already produces fluent text, so the VAE only learns to read/write z.
 vae_arch:
-  latent_dim: 128 # Per-token latent dimensionality.
+  latent_dim: 64 # Per-token latent dimensionality.
   embed_dim: 768 # (Unused by the frozen backbones; kept for config compat.)
   num_layers: 4 # (Unused — encoder is a frozen pretrained backbone now.)
   num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
   dropout: 0.1 # Dropout for the Perceiver pool.
   max_answer_len: 50 # Max answer length on the ENCODER (BERT) side.
   num_latent_tokens: 16 # K latent tokens — the "sequence latent" contribution.
-  # 4→16: K*D = 16*128 = 2048 latent dims. BLEU ~90 needs near-lossless encoding
+  # 4→16: K*D = 16*64 = 1024 latent dims. BLEU ~90 needs near-lossless encoding
   # of up to 50 tokens; K=4 (512 dims, KL-squeezed to ~22 nats) was the
   # information bottleneck behind BLEU ~20.
   # Ablate K=1 to compare directly against LangVAE's single latent vector.
@@ -103,7 +103,7 @@ quality_gate:
   min_recon_accuracy: 0.85 # Min token-level reconstruction accuracy
   min_mean_kl: 1.0 # Min mean KL to avoid posterior collapse (trivially passed
   # in the near-AE regime — KL should sit in the hundreds of nats)
-  min_active_dims: 64 # Min latent dims with variance > threshold (~3% of K*D = 16*128 = 2048)
+  min_active_dims: 64 # Min latent dims with variance > threshold (~6% of K*D = 16*64 = 1024)
   min_centroid_distance: 0.5 # Min L2 between answerable/unanswerable centroids
   active_dim_variance_threshold: 0.1 # Variance cutoff for "active" dimension
   max_dead_slots: 0 # Max latent slots with zero active dims (per-slot collapse)
