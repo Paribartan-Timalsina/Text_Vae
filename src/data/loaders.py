@@ -155,7 +155,7 @@ def create_entailment_dataloaders(
     order = list(range(len(sentences)))
     rng.shuffle(order)
     shuffled = [sentences[i] for i in order]
-    n_val = max(1, round(len(shuffled) * 0.01))
+    n_val = max(1, round(len(shuffled) * 0.02))
     val_sents = shuffled[:n_val]
     train_sents = shuffled[n_val:]
 
