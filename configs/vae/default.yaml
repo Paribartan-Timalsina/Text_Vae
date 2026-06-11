@@ -6,17 +6,17 @@
 # trained. This is the fix for the from-scratch-decoder gibberish — a pretrained
 # LM already produces fluent text, so the VAE only learns to read/write z.
 vae_arch:
-  latent_dim: 32 # Per-token latent dimensionality.
+  latent_dim: 1024 # Per-token latent dimensionality.
   embed_dim: 768 # (Unused by the frozen backbones; kept for config compat.)
   num_layers: 4 # (Unused — encoder is a frozen pretrained backbone now.)
   num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
   dropout: 0.1 # Dropout for the Perceiver pool.
   max_answer_len: 50 # Max answer length on the ENCODER (BERT) side.
-  num_latent_tokens: 16 # K latent tokens — the "sequence latent" contribution.
-  # 4→16: K*D = 16*64 = 1024 latent dims. BLEU ~90 needs near-lossless encoding
-  # of up to 50 tokens; K=4 (512 dims, KL-squeezed to ~22 nats) was the
-  # information bottleneck behind BLEU ~20.
-  # Ablate K=1 to compare directly against LangVAE's single latent vector.
+  num_latent_tokens: 1 # K latent tokens — the "sequence latent" contribution.
+  # K=1, D=1024: single-vector ablation at the SAME total budget as the best
+  # sequence config (16*64 = 1024 dims). Compares directly against LangVAE's
+  # single latent vector geometry — isolates factorization from capacity.
+  # Sequence config for the main results: num_latent_tokens=16, latent_dim=64.
   latent_pos_inject: true # (Kept for compat; the decoder reads decoder.latent_pos_inject.)
   use_bow_head: false # BoW anti-collapse head — OFF (a frozen pretrained decoder
   # no longer collapses the way the from-scratch one did). Re-enable only if
