@@ -72,13 +72,6 @@ class VAEArchConfig:
     num_latent_tokens: int = 16  # K latent tokens (the sequence latent). K*D =
     # 16*128 = 2048 latent dims — capacity for near-lossless encoding of up to
     # ~50 tokens. K=4 (512 dims) was the information bottleneck behind BLEU ~20.
-    pool_num_layers: int = 1  # Depth of the trainable Perceiver query pool. 1 =
-    # a single cross-attention (original behavior). >1 stacks refinement blocks
-    # (cross-attn re-reading the frozen encoder + FFN) so the K queries can
-    # EXTRACT fine lexical/entity identity from the frozen backbone's hidden
-    # states into the latent — the fair, no-unfreeze fix for same-category
-    # subject swaps (Tuna→Toad). Does NOT touch the frozen backbone or latent
-    # geometry (still K*latent_dim).
     latent_pos_inject: bool = True  # (Kept for compat; the decoder reads
     # ``decoder.latent_pos_inject``.)
     use_bow_head: bool = False  # Build a bag-of-words head that predicts the

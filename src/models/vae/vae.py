@@ -43,7 +43,6 @@ class SequenceVAE(nn.Module):
             dropout=arch.dropout,
             vocab_size=encoder_vocab_size,
             unfreeze_top_n=config.encoder.unfreeze_top_n,
-            pool_num_layers=arch.pool_num_layers,
         )
         self.decoder = VAEDecoder(
             model_name=config.decoder.model_name,
