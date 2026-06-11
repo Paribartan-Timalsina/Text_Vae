@@ -17,6 +17,12 @@ vae_arch:
   # of up to 50 tokens; K=4 (512 dims, KL-squeezed to ~22 nats) was the
   # information bottleneck behind BLEU ~20.
   # Ablate K=1 to compare directly against LangVAE's single latent vector.
+  pool_num_layers: 3 # Depth of the trainable Perceiver query pool. 1 = original
+  # single cross-attention. 3 = stack refinement blocks (cross-attn re-reading
+  # the frozen BERT + FFN) so the K queries can EXTRACT exact entity identity
+  # from the frozen backbone — the no-unfreeze fix for same-category subject
+  # swaps (Tuna→Toad) that gate EM. Frozen backbone + 16x128 geometry untouched,
+  # so the LangVAE comparison stays clean.
   latent_pos_inject: true # (Kept for compat; the decoder reads decoder.latent_pos_inject.)
   use_bow_head: false # BoW anti-collapse head — OFF (a frozen pretrained decoder
   # no longer collapses the way the from-scratch one did). Re-enable only if

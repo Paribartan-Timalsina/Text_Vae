@@ -18,6 +18,39 @@ import torch.nn as nn
 from src.utils.pretrained_embeddings import load_pretrained_encoder_model
 
 
+class _PerceiverRefineBlock(nn.Module):
+    """One refinement layer: the K queries re-attend to the frozen encoder's
+    hidden states, then a position-wise FFN. Pre-norm with residuals. Stacking
+    these lets the pool iteratively pull finer detail (e.g. exact entity
+    identity) out of the backbone than a single cross-attention can.
+    """
+
+    def __init__(self, hidden: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.norm_q = nn.LayerNorm(hidden)
+        self.norm_kv = nn.LayerNorm(hidden)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm_ff = nn.LayerNorm(hidden)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden, 4 * hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden, hidden),
+        )
+
+    def forward(
+        self, q: torch.Tensor, kv: torch.Tensor, pad_mask: torch.Tensor
+    ) -> torch.Tensor:
+        attn, _ = self.cross_attn(
+            self.norm_q(q), self.norm_kv(kv), self.norm_kv(kv), key_padding_mask=pad_mask
+        )
+        q = q + attn
+        q = q + self.ff(self.norm_ff(q))
+        return q
+
+
 class VAEEncoder(nn.Module):
     """Frozen pretrained backbone + Perceiver query pool → ``(μ, log_var)``.
 
@@ -51,6 +84,7 @@ class VAEEncoder(nn.Module):
         dropout: float,
         vocab_size: int,
         unfreeze_top_n: int = 0,
+        pool_num_layers: int = 1,
     ) -> None:
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -79,6 +113,14 @@ class VAEEncoder(nn.Module):
         )
         self.cross_attn_norm_q = nn.LayerNorm(hidden)
         self.cross_attn_norm_kv = nn.LayerNorm(hidden)
+
+        # --- Optional deeper pool: refinement blocks beyond the first cross-attn.
+        # pool_num_layers=1 leaves behavior identical to the original single
+        # cross-attention; >1 adds (pool_num_layers - 1) refine blocks.
+        self.refine_layers = nn.ModuleList(
+            _PerceiverRefineBlock(hidden, num_heads, dropout)
+            for _ in range(max(0, pool_num_layers - 1))
+        )
 
         # --- Variational projection (trained) ---
         self.proj = nn.Linear(hidden, latent_dim)
@@ -123,6 +165,11 @@ class VAEEncoder(nn.Module):
         kv = self.cross_attn_norm_kv(hidden)
         pooled, _ = self.cross_attn(q, kv, kv, key_padding_mask=pad_mask)
         pooled = queries + pooled  # residual so init cross-attn doesn't zero out
+
+        # Optional refinement: re-attend the K queries to the frozen hidden
+        # states (each block uses its own pre-norm on the raw backbone output).
+        for layer in self.refine_layers:
+            pooled = layer(pooled, hidden, pad_mask)
 
         h = self.proj(pooled)  # (B, K, latent_dim)
         mu = self.mu_head(h)
