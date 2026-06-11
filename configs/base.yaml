@@ -12,4 +12,10 @@ encoder:
   hidden_dim: 768                     # Must match model's hidden size
   max_context_len: 384                # Max tokens for context passage
   max_question_len: 64                # Max tokens for question
-  unfreeze_top_n: 0                   # Keep entire encoder frozen
+  unfreeze_top_n: 2                   # Unfreeze top 2 BERT layers. Reconstruction
+  # errors are same-category entity swaps on the sentence SUBJECT (Tuna→Toad,
+  # X-rays→Sound waves): mu encodes semantic CLASS but not exact lexical identity.
+  # Eval is deterministic (mu), so it's an ENCODING gap, not sampling noise.
+  # Letting the top encoder layers adapt surfaces entity identity into the pooled
+  # latent — root-cause fix that leaves latent geometry (16x128) and σ (~0.85,
+  # the smooth diffusion prior) untouched. 0 = fully frozen (LangVAE default).
