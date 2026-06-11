@@ -6,7 +6,7 @@
 # trained. This is the fix for the from-scratch-decoder gibberish — a pretrained
 # LM already produces fluent text, so the VAE only learns to read/write z.
 vae_arch:
-  latent_dim: 64 # Per-token latent dimensionality.
+  latent_dim: 32 # Per-token latent dimensionality.
   embed_dim: 768 # (Unused by the frozen backbones; kept for config compat.)
   num_layers: 4 # (Unused — encoder is a frozen pretrained backbone now.)
   num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
