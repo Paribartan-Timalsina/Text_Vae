@@ -6,7 +6,7 @@
 # trained. This is the fix for the from-scratch-decoder gibberish — a pretrained
 # LM already produces fluent text, so the VAE only learns to read/write z.
 vae_arch:
-  latent_dim: 1024 # Per-token latent dimensionality.
+  latent_dim: 128 # Per-token latent dimensionality.
   embed_dim: 768 # (Unused by the frozen backbones; kept for config compat.)
   num_layers: 4 # (Unused — encoder is a frozen pretrained backbone now.)
   num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
@@ -46,7 +46,7 @@ vae_training:
   learning_rate: 1.0e-3 # AdamW peak LR (paper §5.1: LR=0.001). Only the small
   # trained heads/adapters see gradients, so a higher LR than a full-model train.
   batch_size: 50 # Paper §5.1 batch size.
-  epochs: 50 # Paper §5.1 trains 50 epochs.
+  epochs: 100 
   patience: 10 # Early-stopping patience (val checks).
   warmup_steps: 500 # LR warmup steps.
   weight_decay: 0.01 # AdamW weight decay (applies to trained heads only).
