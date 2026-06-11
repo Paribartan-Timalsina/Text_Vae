@@ -64,9 +64,11 @@ def eval_vae(
     vae.eval()
 
     logger.info(
-        "Loaded checkpoint %s (step=%s, saved metrics=%s)",
+        "Loaded checkpoint %s (step=%s). Stored training-time metrics (for "
+        "reference only, NOT this run's result): %s",
         checkpoint_path, ckpt.get("step"), ckpt.get("metrics"),
     )
+    logger.info("Running validation loop over %d batches...", len(val_loader))
 
     tc = config.vae_training
     metrics = _validate(
@@ -86,4 +88,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     cfg = create_config_from_cli()
     metrics = eval_vae(cfg)
-    print("Eval metrics:", metrics)
+    print("Freshly computed val metrics:", metrics)
