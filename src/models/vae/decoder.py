@@ -101,6 +101,11 @@ class VAEDecoder(nn.Module):
         self.prefix_pos_embed = nn.Parameter(
             torch.randn(1, num_latent_tokens, self.hidden) * 0.02
         )
+        # Learned "blank" embedding used to replace word-dropped INPUT tokens
+        # (cleaner than random vocab ids: a neutral mask, not misleading noise).
+        # At high word_dropout this makes teacher forcing behave like a masked
+        # autoencoder so the decoder must reconstruct from z.
+        self.mask_embed = nn.Parameter(torch.randn(1, 1, self.hidden) * 0.02)
         # Per-position injection: a single K-pooled context vector added to
         # every token embedding so z is reachable at each decode step.
         if latent_pos_inject:
@@ -187,14 +192,15 @@ class VAEDecoder(nn.Module):
         B, L = token_ids.shape
         K = self.num_latent_tokens
 
-        in_ids = token_ids
+        tok_emb = self._input_embeddings()(token_ids)  # (B, L, H)
         if self.training and word_dropout > 0.0 and mask_token_id is not None:
+            # Blank a fraction of real input tokens with a LEARNED mask embedding
+            # (not random vocab ids) so the decoder must reconstruct from z.
             real = mask > 0
-            drop = (torch.rand_like(in_ids, dtype=torch.float) < word_dropout) & real
-            rand_ids = torch.randint_like(in_ids, low=0, high=self.vocab_size)
-            in_ids = torch.where(drop, rand_ids, in_ids)
-
-        tok_emb = self._input_embeddings()(in_ids)  # (B, L, H)
+            drop = (torch.rand_like(token_ids, dtype=torch.float) < word_dropout) & real
+            tok_emb = torch.where(
+                drop.unsqueeze(-1), self.mask_embed.to(tok_emb.dtype), tok_emb
+            )
         ctx = self._context(z)
         if ctx is not None:
             tok_emb = tok_emb + ctx

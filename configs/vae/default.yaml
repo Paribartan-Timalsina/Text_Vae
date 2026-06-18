@@ -6,17 +6,17 @@
 # trained. This is the fix for the from-scratch-decoder gibberish — a pretrained
 # LM already produces fluent text, so the VAE only learns to read/write z.
 vae_arch:
-  latent_dim: 128 # Per-token latent dimensionality.
+  latent_dim: 128 # Single-vector setup to match LangVAE's (1,128). 2-NAT
+  # experiment: num_latent_tokens=1 below → one 128-d latent at ~2 nats. (Elastic
+  # multi-slot deferred; flip num_latent_tokens back to 16 + nested_slots=true to
+  # resume it.)
   embed_dim: 768 # (Unused by the frozen backbones; kept for config compat.)
   num_layers: 4 # (Unused — encoder is a frozen pretrained backbone now.)
   num_heads: 8 # Heads for the Perceiver cross-attention pool (768/8 = 96).
   dropout: 0.1 # Dropout for the Perceiver pool.
   max_answer_len: 50 # Max answer length on the ENCODER (BERT) side.
-  num_latent_tokens: 1 # K latent tokens — the "sequence latent" contribution.
-  # K=1, D=1024: single-vector ablation at the SAME total budget as the best
-  # sequence config (16*64 = 1024 dims). Compares directly against LangVAE's
-  # single latent vector geometry — isolates factorization from capacity.
-  # Sequence config for the main results: num_latent_tokens=16, latent_dim=64.
+  num_latent_tokens: 1 # K=1: single 128-d latent vector (matches LangVAE) for the
+  # 2-nat experiment. Set back to 16 (+ nested_slots=true) to resume elastic.
   latent_pos_inject: true # (Kept for compat; the decoder reads decoder.latent_pos_inject.)
   use_bow_head: false # BoW anti-collapse head — OFF (a frozen pretrained decoder
   # no longer collapses the way the from-scratch one did). Re-enable only if
@@ -56,34 +56,51 @@ vae_training:
   grad_accum_steps: 1
   # --- KL regime: standard VAE (beta=1, cyclical annealing) ---
   beta_start: 0.0 # KL weight at the start of warmup.
-  beta_end: 1.0 # Max KL weight. Full beta=1 VAE objective.
+  beta_end: 0.5 # max_beta for CYCLICAL annealing. With target_kl=2.0 (flat) the
+  # hinge pulls the single latent toward ~2 nats (LangVAE's rate). 0.5 (vs
+  # LangVAE's 1.0) is GENTLER → lower collapse risk; KL may settle a bit above 2
+  # nats (~2–4), which is fine. Raise toward 1.0 if true_kl stays well above 2.
   beta_warmup_steps: 5000 # (monotonic schedule only)
-  beta_schedule: cyclical # Fu et al. 2019: beta ramps 0→1 over each cycle,
-  # then resets. Each cycle lets model first learn reconstruction, then compress.
-  # Prevents posterior collapse at full beta=1 pressure.
-  beta_cycles: 40 # Number of annealing cycles over 100 epochs (~2.5 ep/cycle).
-  beta_cycle_ratio: 0.5 # Fraction of each cycle spent ramping (rest held at beta_end).
+  beta_schedule: cyclical # CYCLICAL annealing (Fu 2019), matching LangVAE's ~40
+  # cycles. At low rate a MONOTONIC ramp crushes the latent to the prior before
+  # the frozen decoder learns to read it (KL-vanishing → recon collapse, the
+  # BLEU~20 we saw). Cyclical drops beta to ~0 each cycle so the decoder relearns
+  # z. PRIMARY fix for low-rate reconstruction. (Was monotonic for high-rate.)
+  beta_cycles: 40 # (unused with monotonic)
+  beta_cycle_ratio: 0.5 # (unused with monotonic)
+  free_running_train: false # OFF — too slow / OOM (O(L²) per step). Code kept
+  # dormant in decoder.py. Instead we force z-usage cheaply with high word_dropout
+  # (below), a single parallel pass. Re-enable only if a KV-cached version is added.
   free_bits: 0.0 # OFF — no collapse pressure at beta 0.05, nothing to floor.
   ema_decay: 0.999
-  target_kl: null # OFF. The 2.0-nat hinge was the fidelity bottleneck: it
-  # actively pushed the latent back toward ~2 nats of information.
+  target_kl: 2.0 # KL hinge target ≈ 2 nats TOTAL (single vector → matches
+  # LangVAE's rate). KL below 2 is free, above is penalised at beta.
+  target_kl_per_slot: false # FLAT target (2 nats total), not per-slot — single
+  # vector here anyway. (Per-slot scaling is only for the deferred elastic setup.)
   val_every_n_steps: 500
   noise_aug_sigma: 0.0 # Diffusion-time robustness; enable (~0.1) only after f1_gap
   # confirms z is used.
   noise_aug_prob: 0.0
   null_train_fraction: 0.10 # Keep 10% NULL / 90% answerable in VAE training (SQuAD).
   null_loss_weight: 0.1 # Downweight NULL reconstruction loss.
-  word_dropout: 0.2 # Replace 20% of teacher-forced decoder INPUT tokens with a
-  # RANDOM token (Bowman 2016). 0.5→0.2: with deep injection + near-AE KL the
-  # decoder has no incentive to bypass z (free-running eval self-enforces
-  # z-usage); keep a light dose for exposure robustness only. Heavy dropout
-  # spends model capacity on noise robustness and costs reconstruction BLEU.
+  word_dropout: 0.7 # THE anti-bypass for the 2-nat regime. At 0.7, ~70% of
+  # teacher-forced input tokens are blanked (→ learned mask embed, see decoder.py)
+  # so the decoder must reconstruct from z + GPT-2 positions → forces z-usage in
+  # ONE parallel pass (cheap stand-in for free-running). Sweep 0.5/0.7/0.9.
   bow_loss_weight: 0.0 # OFF (reserve lever; requires use_bow_head).
-  zforce_weight: 0.3 # Second decode with word_dropout=1.0 (ALL inputs corrupted)
-  # so the decoder reconstructs from the z-prefix ALONE. 1.0→0.3: demoted from
-  # primary anti-bypass cure to regularizer — useful gradient signal for the
-  # generation-like condition, but no longer allowed to dominate the
-  # teacher-forced reconstruction term that drives fidelity.
+  # --- Nested (ElasticTok-style) latent slots ---
+  nested_slots: false # OFF — single vector for the 2-nat experiment (elastic
+  # deferred). Set true (+ num_latent_tokens 16) to resume nested/elastic training.
+  nested_slot_values: "1,2,4,8,16" # k sampled uniformly per training batch.
+  # k=1 is KEPT intentionally (single-slot extreme-compression is a goal). Note
+  # ElasticTok floors its budget (min_toks=256 of 2048) because "sampling too
+  # few tokens destabilizes training" — so k=1 is the riskiest/least-stable
+  # point; if training is unstable, dropping k=1 is the first thing to try.
+  nested_val_slots: "1,4,16" # k ladder per val step (full sweep offline via
+  # eval_vae --slot_sweep). Checkpoint selection / early stopping use largest k.
+  zforce_weight: 0.5 # Reinforce z-only reconstruction (second decode with all
+  # inputs blanked) alongside word_dropout=0.7. Both push the decoder to rely on
+  # z at ~2 nats. Sweep down to 0 if it over-constrains.
 
 quality_gate:
   min_recon_accuracy: 0.85 # Min token-level reconstruction accuracy
