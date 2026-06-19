@@ -54,29 +54,15 @@ vae_training:
   # LR throttled, convergence crawled. 5.0 lets gradients through while still
   # catching spikes.
   grad_accum_steps: 1
-  # --- KL regime: near-autoencoder (latent-diffusion recipe) ---
-  # Goal is high-fidelity reconstruction (BLEU ~90): the latent must carry
-  # hundreds of nats, so KL pressure is tiny — like Stable Diffusion's VAE
-  # (KL weight ~1e-4..1e-2). The downstream diffusion model learns the prior;
-  # exported latents are normalized via normalization_stats.pt, so a non-smooth
-  # N(0,I) fit is acceptable. The old regime (beta_end=1.0, target_kl=2.0)
-  # squeezed val/true_kl to ~22 nats ≈ 32 bits — mathematically too little to
-  # pin down a 50-token sentence; that was the BLEU ~20 ceiling.
-  # NOTE: prior-sampling quality (decode z ~ N(0,I)) is traded away here.
+  # --- KL regime: standard VAE (beta=1, cyclical annealing) ---
   beta_start: 0.0 # KL weight at the start of warmup.
-  beta_end: 0.01 # Max KL weight. 0.05→0.01: at 0.05 the posterior kept nonzero
-  # std (latent/std_mean ~0.84) so eval-time z=mu lost the noised-away low-
-  # redundancy bits — content-word substitutions ("Tuna"→"Toad", "cold water"→
-  # "water") capped EM ~35 / BLEU ~70 while the sentence skeleton reconstructed
-  # perfectly. 10x less KL pressure = more bits for rare/content tokens. Watch
-  # val/f1_gap (must hold — it is the collapse guard) and latent/std_mean
-  # (should fall toward ~0.1 as the posterior sharpens).
+  beta_end: 1.0 # Max KL weight. Full beta=1 VAE objective.
   beta_warmup_steps: 5000 # (monotonic schedule only)
-  beta_schedule: monotonic # Cyclical annealing was an anti-collapse measure;
-  # at beta 0.05 there is no collapse pressure to fight, and a stable beta
-  # gives smoother training than 40 squeeze/release cycles.
-  beta_cycles: 40 # (unused with monotonic)
-  beta_cycle_ratio: 0.5 # (unused with monotonic)
+  beta_schedule: cyclical # Fu et al. 2019: beta ramps 0→1 over each cycle,
+  # then resets. Each cycle lets model first learn reconstruction, then compress.
+  # Prevents posterior collapse at full beta=1 pressure.
+  beta_cycles: 40 # Number of annealing cycles over 100 epochs (~2.5 ep/cycle).
+  beta_cycle_ratio: 0.5 # Fraction of each cycle spent ramping (rest held at beta_end).
   free_bits: 0.0 # OFF — no collapse pressure at beta 0.05, nothing to floor.
   ema_decay: 0.999
   target_kl: null # OFF. The 2.0-nat hinge was the fidelity bottleneck: it
