@@ -12,3 +12,12 @@ checkpoints/
 latents/
 outputs/
 wandb/
+
+wandb_dump/
+WANDB.py
+wandb*/
+
+*.pdf
+
+
+
