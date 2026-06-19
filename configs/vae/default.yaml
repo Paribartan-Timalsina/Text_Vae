@@ -68,15 +68,10 @@ vae_training:
   # z. PRIMARY fix for low-rate reconstruction. (Was monotonic for high-rate.)
   beta_cycles: 40 # (unused with monotonic)
   beta_cycle_ratio: 0.5 # (unused with monotonic)
-  free_running_train: false # OFF — too slow / OOM (O(L²) per step). Code kept
-  # dormant in decoder.py. Instead we force z-usage cheaply with high word_dropout
-  # (below), a single parallel pass. Re-enable only if a KV-cached version is added.
   free_bits: 0.0 # OFF — no collapse pressure at beta 0.05, nothing to floor.
   ema_decay: 0.999
   target_kl: 2.0 # KL hinge target ≈ 2 nats TOTAL (single vector → matches
   # LangVAE's rate). KL below 2 is free, above is penalised at beta.
-  target_kl_per_slot: false # FLAT target (2 nats total), not per-slot — single
-  # vector here anyway. (Per-slot scaling is only for the deferred elastic setup.)
   val_every_n_steps: 500
   noise_aug_sigma: 0.0 # Diffusion-time robustness; enable (~0.1) only after f1_gap
   # confirms z is used.
@@ -88,16 +83,6 @@ vae_training:
   # so the decoder must reconstruct from z + GPT-2 positions → forces z-usage in
   # ONE parallel pass (cheap stand-in for free-running). Sweep 0.5/0.7/0.9.
   bow_loss_weight: 0.0 # OFF (reserve lever; requires use_bow_head).
-  # --- Nested (ElasticTok-style) latent slots ---
-  nested_slots: false # OFF — single vector for the 2-nat experiment (elastic
-  # deferred). Set true (+ num_latent_tokens 16) to resume nested/elastic training.
-  nested_slot_values: "1,2,4,8,16" # k sampled uniformly per training batch.
-  # k=1 is KEPT intentionally (single-slot extreme-compression is a goal). Note
-  # ElasticTok floors its budget (min_toks=256 of 2048) because "sampling too
-  # few tokens destabilizes training" — so k=1 is the riskiest/least-stable
-  # point; if training is unstable, dropping k=1 is the first thing to try.
-  nested_val_slots: "1,4,16" # k ladder per val step (full sweep offline via
-  # eval_vae --slot_sweep). Checkpoint selection / early stopping use largest k.
   zforce_weight: 0.5 # Reinforce z-only reconstruction (second decode with all
   # inputs blanked) alongside word_dropout=0.7. Both push the decoder to rely on
   # z at ~2 nats. Sweep down to 0 if it over-constrains.
