@@ -52,13 +52,19 @@ class TestDotNotation:
 
 class TestLoadConfig:
     def test_multi_yaml_merge(self):
+        import yaml
+
+        # Expected value comes from default.yaml itself so the test verifies the
+        # merge/load path without churning every time latent_dim is tuned.
+        with open("configs/vae/default.yaml") as f:
+            expected = yaml.safe_load(f)["vae_arch"]["latent_dim"]
         config = load_config(
             [
                 "configs/base.yaml",
                 "configs/vae/default.yaml",
             ]
         )
-        assert config.vae_arch.latent_dim == 128
+        assert config.vae_arch.latent_dim == expected
 
     def test_cli_overrides_applied(self):
         config = load_config(
