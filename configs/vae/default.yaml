@@ -69,12 +69,13 @@ vae_training:
   # z. PRIMARY fix for low-rate reconstruction. (Was monotonic for high-rate.)
   beta_cycles: 40 # (unused with monotonic)
   beta_cycle_ratio: 0.5 # (unused with monotonic)
-  free_bits: 0.05 # PER-DIM KL floor (anti-monopoly) for the K-slot bandwidth test.
-  # At beta_end=0.5 the model sits ~31 nats, so the floor (0.05×K×D = 6.4 nats) is
-  # well under the operating point (doesn't change the rate) — its job is to force
-  # the K slots to SHARE the budget: each slot floored at 0.05×D nats so no single
-  # slot monopolizes (which would make K-slots no better than (1,128)). Raise to
-  # 0.08 if per-slot KL still shows slot-0 dominance.
+  free_bits: 0.2 # PER-DIM KL floor (anti-monopoly) for the K-slot bandwidth test.
+  # Per-slot floor = 0.2×D = 3.2 nats → every one of the 8 slots is FORCED to hold
+  # ≥3.2 nats → no slot-0 monopoly, all 8 KV slots strongly used (real bandwidth).
+  # Total floor = 0.2×128 = 25.6 nats, just under the ~31 the model reaches at
+  # beta_end=0.5, so it spreads the budget without inflating the rate. NOTE: if
+  # this run's natural KL is < 25.6, the floor will PIN true_kl up to ~25.6 — watch
+  # train/true_kl; lower free_bits (→0.15) if you want the rate left untouched.
   ema_decay: 0.999
   target_kl: 2.0 # KL hinge target ≈ 2 nats TOTAL (single vector → matches
   # LangVAE's rate). KL below 2 is free, above is penalised at beta.
