@@ -55,6 +55,14 @@ class DecoderConfig:
     # layer's attention (past_key_values), in addition to the input-layer prefix.
     # Raises the z→decoder bandwidth by ~n_layer×, the main lever for high-
     # fidelity reconstruction (BLEU). False = input-layer prefix + context only.
+    kv_fanout_len: int = 0  # Full-sequence KV fan-out (LangVAE's W_m mechanism).
+    # 0 = OFF (the K latent tokens map 1-to-1 to K KV slots/layer, current
+    # behaviour). >0 = pool the latent to ONE vector and FAN it into this many
+    # KV (key,value) slots PER decoder layer, so a single (K=1) vector gives the
+    # frozen decoder ~kv_fanout_len read-points/layer instead of 1. This is the
+    # bit-efficiency lever that lets LangVAE read a ~2-nat latent into BLEU 0.76.
+    # Set to ~max_answer_len. Cost: kv_proj grows ~kv_fanout_len× (~118M params at
+    # 50). Only active when deep_inject=True.
 
 
 @dataclass(frozen=True)
