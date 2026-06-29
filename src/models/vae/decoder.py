@@ -65,6 +65,7 @@ class VAEDecoder(nn.Module):
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
         deep_inject: bool = False,
+        kv_fanout_len: int = 0,
     ) -> None:
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -118,17 +119,32 @@ class VAEDecoder(nn.Module):
         # layer's attention, via past_key_values. Every layer at every position
         # can then attend directly into z — ~n_layer× the bandwidth of the
         # input-layer prefix alone, the main lever for reconstruction fidelity.
+        # Number of latent-derived KV memory slots per layer (the latent→decoder
+        # bandwidth). Default = num_latent_tokens (1-to-1, each latent token → 1
+        # slot). With kv_fanout_len>0 a SINGLE pooled latent fans into that many
+        # slots/layer (LangVAE's W_m), decoupling bandwidth from K.
+        self.kv_fanout = deep_inject and kv_fanout_len > 0
+        self.kv_mem_len = kv_fanout_len if self.kv_fanout else num_latent_tokens
         if deep_inject:
             self.n_layer = getattr(cfg, "n_layer", None) or cfg.num_hidden_layers
             n_head = getattr(cfg, "n_head", None) or cfg.num_attention_heads
             n_kv_head = getattr(cfg, "num_key_value_heads", None) or n_head
             self.n_kv_head = n_kv_head
             self.kv_head_dim = self.hidden // n_head
+            # Fan-out: project ONE latent vector into kv_mem_len KV slots/layer.
+            # Otherwise: project each latent token into 1 slot/layer (per-token).
             self.kv_proj = nn.Linear(
-                latent_dim, self.n_layer * 2 * n_kv_head * self.kv_head_dim
+                latent_dim,
+                self.n_layer * 2 * n_kv_head * self.kv_head_dim * self.kv_mem_len
+                if self.kv_fanout
+                else self.n_layer * 2 * n_kv_head * self.kv_head_dim,
             )
+            # Dropout on the (large) fan-out projection — guards overfit, as in
+            # LangVAE (sentence.py: nn.Dropout(p=0.1) on context_hidden).
+            self.kv_dropout = nn.Dropout(0.1) if self.kv_fanout else None
         else:
             self.kv_proj = None
+            self.kv_dropout = None
 
     # ------------------------------------------------------------------
     def _input_embeddings(self) -> nn.Module:
@@ -157,9 +173,18 @@ class VAEDecoder(nn.Module):
         if self.kv_proj is None:
             return None
         B, K, _ = z.shape
-        kv = self.kv_proj(z)  # (B, K, n_layer * 2 * n_kv_head * head_dim)
-        kv = kv.view(B, K, self.n_layer, 2, self.n_kv_head, self.kv_head_dim)
-        kv = kv.permute(2, 3, 0, 4, 1, 5)  # (n_layer, 2, B, n_kv_head, K, hd)
+        if self.kv_fanout:
+            # Pool the latent to a SINGLE vector and fan it into M=kv_mem_len KV
+            # slots per layer (LangVAE-style). At K=1 the mean is just the vector.
+            M = self.kv_mem_len
+            pooled = z.mean(dim=1)  # (B, latent_dim)
+            kv = self.kv_dropout(self.kv_proj(pooled))  # (B, n_layer*2*n_kv_head*M*hd)
+            kv = kv.view(B, self.n_layer, 2, self.n_kv_head, M, self.kv_head_dim)
+            kv = kv.permute(1, 2, 0, 3, 4, 5)  # (n_layer, 2, B, n_kv_head, M, hd)
+        else:
+            kv = self.kv_proj(z)  # (B, K, n_layer * 2 * n_kv_head * head_dim)
+            kv = kv.view(B, K, self.n_layer, 2, self.n_kv_head, self.kv_head_dim)
+            kv = kv.permute(2, 3, 0, 4, 1, 5)  # (n_layer, 2, B, n_kv_head, K, hd)
         layers = tuple(
             (kv[layer][0].contiguous(), kv[layer][1].contiguous())
             for layer in range(self.n_layer)
@@ -213,9 +238,11 @@ class VAEDecoder(nn.Module):
         )
         past = self._past_kv(z)
         if past is not None:
-            # K extra always-visible memory slots per layer; extend the mask.
+            # kv_mem_len extra always-visible memory slots per layer (= K for
+            # per-token injection, = kv_fanout_len for fan-out); extend the mask.
+            M = self.kv_mem_len
             attn = torch.cat(
-                [torch.ones(B, K, dtype=mask.dtype, device=mask.device), attn], dim=1
+                [torch.ones(B, M, dtype=mask.dtype, device=mask.device), attn], dim=1
             )
         out = self.lm(
             inputs_embeds=inputs_embeds,
@@ -268,7 +295,7 @@ class VAEDecoder(nn.Module):
             # Fresh cache each step (Cache.update mutates) — mirrors forward(),
             # where the K memory slots always precede the recomputed sequence.
             past = self._past_kv(z)
-            attn_len = inp.size(1) + (self.num_latent_tokens if past is not None else 0)
+            attn_len = inp.size(1) + (self.kv_mem_len if past is not None else 0)
             attn = torch.ones(inp.size(0), attn_len, dtype=torch.long, device=device)
             out = self.lm(
                 inputs_embeds=inp,
