@@ -1,0 +1,11 @@
+# Combo: Flan-T5 encoder + GPT-2 decoder.
+# Layer OVER base.yaml + default.yaml. Cheap (runs on any GPU). Exercises the
+# Flan-T5 encoder path (AutoModelForTextEncoding -> T5EncoderModel; d_model=768).
+encoder:
+  model_name: google/flan-t5-base   # encoder-only stack is loaded automatically.
+decoder:
+  model_name: gpt2
+  kv_fanout_len: 50
+  torch_dtype: float32
+vae_training:
+  dataset: entailment_bank

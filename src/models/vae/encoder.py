@@ -61,7 +61,10 @@ class VAEEncoder(nn.Module):
         if self.backbone.get_input_embeddings().weight.size(0) != vocab_size:
             self.backbone.resize_token_embeddings(vocab_size)
             self.backbone.requires_grad_(False)  # re-freeze any new rows
-        hidden = self.backbone.config.hidden_size
+        # BERT-family configs expose ``hidden_size``; T5-family (Flan-T5) use
+        # ``d_model``. Support both so the encoder backbone is swappable.
+        cfg = self.backbone.config
+        hidden = getattr(cfg, "hidden_size", None) or cfg.d_model
 
         # Optionally unfreeze the top-N transformer layers of the backbone.
         if unfreeze_top_n > 0:

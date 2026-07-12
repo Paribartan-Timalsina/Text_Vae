@@ -61,8 +61,20 @@ class DecoderConfig:
     # KV (key,value) slots PER decoder layer, so a single (K=1) vector gives the
     # frozen decoder ~kv_fanout_len read-points/layer instead of 1. This is the
     # bit-efficiency lever that lets LangVAE read a ~2-nat latent into BLEU 0.76.
-    # Set to ~max_answer_len. Cost: kv_proj grows ~kv_fanout_len× (~118M params at
-    # 50). Only active when deep_inject=True.
+    # Set to ~max_answer_len. Cost: kv_proj = latent_dim × (n_layer×2×n_kv_head×
+    # head_dim×kv_fanout_len). At 50: ~118M on GPT-2, ~370M on Llama-3B, ~423M on
+    # Mistral-7B (GQA keeps n_kv_head small) — all trainable, same order as LangVAE's
+    # own W_m. Only active when deep_inject=True.
+    torch_dtype: str = "float32"  # Load dtype for the decoder LM: "float32",
+    # "float16", or "bfloat16". Use "bfloat16" for large decoders (Mistral/Llama)
+    # on A100 — fp32 would need ~4× the memory. The trained injection heads stay
+    # fp32; their outputs are cast to this dtype at injection time.
+    load_in_4bit: bool = False  # 4-bit NF4 quantization (QLoRA) for the frozen
+    # decoder backbone — needed to fit 3B/7B decoders. Requires bitsandbytes and
+    # use_lora=True (adapters train in the compute dtype over the quantized base).
+    device_map: Optional[str] = None  # HF device_map for the decoder (e.g.
+    # "auto" to shard a large model across GPUs). None keeps it on the default
+    # device (the training loop's .to(device)).
 
 
 @dataclass(frozen=True)

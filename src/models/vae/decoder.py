@@ -66,20 +66,44 @@ class VAEDecoder(nn.Module):
         lora_dropout: float = 0.05,
         deep_inject: bool = False,
         kv_fanout_len: int = 0,
+        torch_dtype: str = "float32",
+        load_in_4bit: bool = False,
+        device_map: str | None = None,
     ) -> None:
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
         self.max_answer_len = max_answer_len
         self.latent_pos_inject = latent_pos_inject
 
-        # --- Frozen pretrained causal LM ---
-        lm = AutoModelForCausalLM.from_pretrained(model_name)
+        # Compute dtype for the LM (and the dtype the injected latent tensors are
+        # cast to). bfloat16/float16 keep large decoders (Mistral/Llama) in memory;
+        # the trained heads stay fp32 and are cast at injection time.
+        self.compute_dtype = getattr(torch, torch_dtype)
+
+        # --- Frozen pretrained causal LM (optionally 4-bit / reduced precision) ---
+        load_kwargs: dict = {"torch_dtype": self.compute_dtype}
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
+        if load_in_4bit:
+            from transformers import BitsAndBytesConfig
+
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=self.compute_dtype,
+            )
+        lm = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         lm.eval()
         lm.requires_grad_(False)
 
         if use_lora:
             from peft import LoraConfig, get_peft_model, TaskType
 
+            if load_in_4bit:
+                from peft import prepare_model_for_kbit_training
+
+                lm = prepare_model_for_kbit_training(lm)
             lora_cfg = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=lora_r,
@@ -142,6 +166,18 @@ class VAEDecoder(nn.Module):
             # Dropout on the (large) fan-out projection — guards overfit, as in
             # LangVAE (sentence.py: nn.Dropout(p=0.1) on context_hidden).
             self.kv_dropout = nn.Dropout(0.1) if self.kv_fanout else None
+            # Guard: fan-out on a large decoder explodes kv_proj (n_layer ×
+            # n_kv_head × head_dim × M grows fast). Warn so a mis-set
+            # kv_fanout_len on Mistral/Llama is caught before OOM.
+            kv_params = self.kv_proj.weight.numel()
+            if kv_params > 1_500_000_000:
+                logger.warning(
+                    "kv_proj has %.1fB params (kv_fanout_len=%d on %s). That is very "
+                    "large — consider lowering decoder.kv_fanout_len.",
+                    kv_params / 1e9, self.kv_mem_len, model_name,
+                )
+            else:
+                logger.info("kv_proj: %.0fM params (kv_fanout_len=%d)", kv_params / 1e6, self.kv_mem_len)
         else:
             self.kv_proj = None
             self.kv_dropout = None
@@ -157,12 +193,14 @@ class VAEDecoder(nn.Module):
                 f"Decoder expects z of shape (B, {self.num_latent_tokens}, latent_dim); "
                 f"got {tuple(z.shape)}"
             )
-        return self.latent_proj(z) + self.prefix_pos_embed
+        prefix = self.latent_proj(z) + self.prefix_pos_embed
+        return prefix.to(self.compute_dtype)  # match the (possibly bf16) LM
 
     def _context(self, z: torch.Tensor) -> torch.Tensor | None:
         if self.latent_context_proj is None:
             return None
-        return self.latent_context_proj(z.mean(dim=1, keepdim=True))  # (B, 1, H)
+        ctx = self.latent_context_proj(z.mean(dim=1, keepdim=True))  # (B, 1, H)
+        return ctx.to(self.compute_dtype)
 
     def _past_kv(self, z: torch.Tensor) -> object | None:
         """``(B, K, latent_dim)`` → per-layer K-slot key/value memory.
@@ -185,6 +223,7 @@ class VAEDecoder(nn.Module):
             kv = self.kv_proj(z)  # (B, K, n_layer * 2 * n_kv_head * head_dim)
             kv = kv.view(B, K, self.n_layer, 2, self.n_kv_head, self.kv_head_dim)
             kv = kv.permute(2, 3, 0, 4, 1, 5)  # (n_layer, 2, B, n_kv_head, K, hd)
+        kv = kv.to(self.compute_dtype)  # match the (possibly bf16) LM attention
         layers = tuple(
             (kv[layer][0].contiguous(), kv[layer][1].contiguous())
             for layer in range(self.n_layer)

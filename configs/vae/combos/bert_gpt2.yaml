@@ -1,0 +1,13 @@
+# Combo: BERT encoder + GPT-2 decoder (LangVAE Table-1 "0.76" row).
+# Layer this OVER base.yaml + default.yaml:
+#   load_config(["configs/base.yaml", "configs/vae/default.yaml",
+#                "configs/vae/combos/bert_gpt2.yaml"])
+# Cheap (runs on any GPU). Full KV fan-out is used here.
+encoder:
+  model_name: bert-base-cased   # LangVAE used the CASED BERT (base.yaml is uncased).
+decoder:
+  model_name: gpt2
+  kv_fanout_len: 50             # full fan-out — ~118M kv_proj params on GPT-2 (fine).
+  torch_dtype: float32
+vae_training:
+  dataset: entailment_bank      # EntailmentBank explanatory sentences (LangVAE corpus).

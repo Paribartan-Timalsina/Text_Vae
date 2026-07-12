@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 def load_pretrained_encoder_model(model_name: str, freeze: bool = True):
-    """Load a pretrained ``AutoModel`` (e.g. BERT) for use as a frozen encoder.
+    """Load a pretrained encoder backbone for use as a frozen VAE encoder.
+
+    Uses ``AutoModelForTextEncoding`` so encoder-decoder models (e.g. Flan-T5)
+    load their ENCODER stack only (a ``T5EncoderModel``) — a plain ``AutoModel``
+    would load the full T5 and expose the decoder's ``last_hidden_state``, which
+    is wrong. Encoder-only models like BERT are unaffected. Falls back to
+    ``AutoModel`` for any architecture ``AutoModelForTextEncoding`` can't map.
 
     Returns the HuggingFace model in eval mode with ``requires_grad_(False)``
     when *freeze* is True. The VAE encoder runs the answer through this frozen
@@ -25,9 +31,13 @@ def load_pretrained_encoder_model(model_name: str, freeze: bool = True):
     caller (``resize_token_embeddings``) to cover added special tokens like
     ``[NULL_ANS]``.
     """
-    from transformers import AutoModel
+    from transformers import AutoModel, AutoModelForTextEncoding
 
-    model = AutoModel.from_pretrained(model_name)
+    try:
+        model = AutoModelForTextEncoding.from_pretrained(model_name)
+    except (ValueError, KeyError, EnvironmentError):
+        # Architecture not registered for text-encoding; use the base model.
+        model = AutoModel.from_pretrained(model_name)
     if freeze:
         model.eval()
         model.requires_grad_(False)

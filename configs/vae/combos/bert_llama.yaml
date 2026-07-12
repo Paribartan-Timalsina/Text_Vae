@@ -1,0 +1,18 @@
+# Combo: BERT encoder + Llama-3.2-3B decoder.
+# Layer OVER base.yaml + default.yaml. Needs a large GPU (A100). GATED model:
+# run `huggingface-cli login` and accept the Llama-3.2 license on HF first.
+encoder:
+  model_name: bert-base-cased
+decoder:
+  model_name: meta-llama/Llama-3.2-3B
+  kv_fanout_len: 50         # FULL fan-out, like LangVAE (fair comparison). kv_proj
+  # here is ~370M params (GQA: 8 kv-heads × 128 head-dim × 28 layers × 50) — the
+  # SAME order as LangVAE's own W_m; trains fine on an A100.
+  torch_dtype: bfloat16     # 3B in bf16 (~6GB) fits comfortably on an A100; the
+  # injected latent tensors are cast to bf16 to match. Works with the pipeline's
+  # .to(device). For a smaller GPU set load_in_4bit: true (see combos/README.md).
+  load_in_4bit: false
+  device_map: null
+vae_training:
+  dataset: entailment_bank
+  batch_size: 8             # large decoder + zforce second pass — keep the batch small.
