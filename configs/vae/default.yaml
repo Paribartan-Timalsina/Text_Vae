@@ -52,7 +52,7 @@ vae_training:
   learning_rate: 1.0e-3 # AdamW peak LR (paper §5.1: LR=0.001). Only the small
   # trained heads/adapters see gradients, so a higher LR than a full-model train.
   batch_size: 50 # Paper §5.1 batch size.
-  epochs: 100 
+  epochs: 50 # Matches LangVAE's training length for a fair combo comparison.
   patience: 10 # Early-stopping patience (val checks).
   warmup_steps: 500 # LR warmup steps.
   weight_decay: 0.01 # AdamW weight decay (applies to trained heads only).
