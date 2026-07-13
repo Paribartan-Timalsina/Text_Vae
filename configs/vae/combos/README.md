@@ -8,8 +8,12 @@ backbone names and the per-combo knobs (KV fan-out, dtype, batch size).
 |-------|---------|---------|------|---------|---------|
 | `bert_gpt2` | bert-base-cased | gpt2 | cheap | 50 | ~119M |
 | `flant5_gpt2` | google/flan-t5-base | gpt2 | cheap | 50 | ~119M |
+| `bert_qwen15` | bert-base-cased | Qwen/Qwen2.5-1.5B | cheap (1 GPU) | 50 | ~92M |
 | `bert_llama` | bert-base-cased | meta-llama/Llama-3.2-3B | A100 | 50 | ~370M |
 | `bert_mistral` | bert-base-cased | mistralai/Mistral-7B-v0.3 | A100-80GB | 50 | ~423M |
+
+`bert_qwen15` is **open** (no gating) and keeps the full recipe (LoRA on, lr=1e-3) like
+the GPT-2 combo — a stable, single-GPU decoder from LangVAE's own Qwen family.
 
 All four use **full KV fan-out** (`kv_fanout_len=50`), matching LangVAE's per-layer
 W_m, so the comparison is fair across decoders.

@@ -1,0 +1,19 @@
+# Combo: BERT encoder + Qwen2.5-1.5B decoder.
+# Layer OVER base.yaml + default.yaml. Small + OPEN (no HF gating), so it keeps your
+# FULL recipe — LoRA on, lr=1e-3 — consistent with the GPT-2 combo, and trains
+# stably on a single GPU (unlike the 3B/7B decoders). Qwen2.5 is also LangVAE's
+# decoder family (they used Qwen2.5-3B), so this is a same-family, trainable data point.
+encoder:
+  model_name: bert-base-cased
+decoder:
+  model_name: Qwen/Qwen2.5-1.5B
+  use_lora: true            # keep LoRA (your recipe) — Qwen uses q_proj/v_proj, which
+  # the LoRA target selector already handles. Small model → stable at lr=1e-3.
+  kv_fanout_len: 50         # full fan-out. kv_proj ≈ 92M params (GQA: 2 kv-heads ×
+  # 128 head-dim × 28 layers × 50) — tiny; trains easily.
+  torch_dtype: float32      # 1.5B in fp32 fits fine on an A100 and matches the GPT-2
+  # combo's precision (no bf16 confound). Switch to bfloat16 if you want it lighter.
+vae_training:
+  dataset: entailment_bank
+  batch_size: 32            # 1.5B + LoRA + zforce pass; 32 is a solid A100 default
+  # (bump to 50 to match the GPT-2 combo if memory allows, or add grad_accum_steps).
