@@ -5,6 +5,9 @@ encoder:
   model_name: bert-base-cased
 decoder:
   model_name: meta-llama/Llama-3.2-3B
+  use_lora: false           # NO LoRA: fully frozen decoder + trainable injection only
+  # (LangVAE's exact regime). LoRA on a 3B decoder at batch 8 diverged; dropping it
+  # removes the instability. This run is also the "-LoRA" ablation.
   kv_fanout_len: 50         # FULL fan-out, like LangVAE (fair comparison). kv_proj
   # here is ~370M params (GQA: 8 kv-heads × 128 head-dim × 28 layers × 50) — the
   # SAME order as LangVAE's own W_m; trains fine on an A100.
@@ -15,4 +18,9 @@ decoder:
   device_map: null
 vae_training:
   dataset: entailment_bank
-  batch_size: 8             # large decoder + zforce second pass — keep the batch small.
+  batch_size: 16            # no LoRA frees memory → larger batch = smoother gradients
+  # (closer to LangVAE's 50). Drop to 8 if you OOM.
+  learning_rate: 1.0e-3     # LangVAE's LR. Stable now that the only trainable big
+  # module is kv_proj (frozen decoder). If latent/z_std spikes early, drop to 3e-4.
+  grad_clip_max_norm: 1.0   # safety rail against gradient spikes.
+  warmup_steps: 1000        # ease the large from-scratch kv_proj in.
