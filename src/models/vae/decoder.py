@@ -34,6 +34,25 @@ def _lora_target_modules(model_name: str) -> list[str]:
     return ["q_proj", "v_proj"]
 
 
+def _decoder_uses_rope(cfg) -> bool:
+    """True if the decoder uses rotary position embeddings (RoPE).
+
+    RoPE decoders (Llama/Qwen/Mistral/…) rotate keys and queries by position, so
+    raw un-rotated KV injected via ``past_key_values`` is misaligned with the
+    rotated queries and the latent becomes unreadable. Such decoders need the
+    prefix-fan-out path instead. GPT-2 (absolute positions) returns False.
+    """
+    if getattr(cfg, "rope_theta", None) is not None:
+        return True
+    if getattr(cfg, "rope_scaling", None) is not None:
+        return True
+    mt = (getattr(cfg, "model_type", "") or "").lower()
+    return mt in {
+        "llama", "qwen2", "qwen2_moe", "qwen3", "mistral", "mixtral",
+        "gemma", "gemma2", "phi", "phi3", "gptneox", "falcon",
+    }
+
+
 def _build_cache(layers: tuple) -> object:
     """Wrap legacy ``((k, v), ...)`` layers in a ``Cache`` object when the
     installed transformers requires it; fall back to the raw tuple."""
@@ -69,6 +88,7 @@ class VAEDecoder(nn.Module):
         torch_dtype: str = "float32",
         load_in_4bit: bool = False,
         device_map: str | None = None,
+        fanout_mode: str = "auto",
     ) -> None:
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -138,37 +158,58 @@ class VAEDecoder(nn.Module):
         else:
             self.latent_context_proj = None
 
-        # Deep injection (Optimus / LangVAE KV-cache style): project each of
-        # the K latent tokens into a key/value memory slot in EVERY decoder
-        # layer's attention, via past_key_values. Every layer at every position
-        # can then attend directly into z — ~n_layer× the bandwidth of the
-        # input-layer prefix alone, the main lever for reconstruction fidelity.
-        # Number of latent-derived KV memory slots per layer (the latent→decoder
-        # bandwidth). Default = num_latent_tokens (1-to-1, each latent token → 1
-        # slot). With kv_fanout_len>0 a SINGLE pooled latent fans into that many
-        # slots/layer (LangVAE's W_m), decoupling bandwidth from K.
-        self.kv_fanout = deep_inject and kv_fanout_len > 0
+        # Deep injection (Optimus / LangVAE style): fan the latent into extra
+        # read-points the decoder attends to. Two routes, chosen by fanout_mode:
+        #   * "kv"     — raw per-layer key/value memory via past_key_values.
+        #                Correct for ABSOLUTE-position decoders (GPT-2).
+        #   * "prefix" — the fan-out is projected into soft-prompt PREFIX
+        #                embeddings prepended to the input, so the decoder applies
+        #                its OWN (rotary) position encoding to them. Required for
+        #                ROTARY (RoPE) decoders, where raw un-rotated injected KV
+        #                is misaligned with the rotated queries → latent unreadable.
+        #   * "auto"   — "prefix" if the decoder uses RoPE, else "kv".
+        resolved_mode = fanout_mode
+        if fanout_mode == "auto":
+            resolved_mode = "prefix" if _decoder_uses_rope(cfg) else "kv"
+        elif fanout_mode not in ("kv", "prefix"):
+            raise ValueError(f"fanout_mode must be auto/kv/prefix; got {fanout_mode!r}")
+
+        self.kv_fanout = deep_inject and kv_fanout_len > 0 and resolved_mode == "kv"
+        self.prefix_fanout = deep_inject and kv_fanout_len > 0 and resolved_mode == "prefix"
+        # KV memory length (only meaningful in kv mode); prefix length includes
+        # the K latent tokens plus (in prefix mode) the M fan-out tokens.
         self.kv_mem_len = kv_fanout_len if self.kv_fanout else num_latent_tokens
-        if deep_inject:
+        self.fanout_prefix_len = kv_fanout_len if self.prefix_fanout else 0
+        self.prefix_len = num_latent_tokens + self.fanout_prefix_len
+
+        self.kv_proj = None
+        self.kv_dropout = None
+        self.fanout_prefix_proj = None
+        self.fanout_dropout = None
+
+        if self.prefix_fanout:
+            # RoPE-safe fan-out: pool z → M prefix embeddings (M×hidden — tiny).
+            self.fanout_prefix_proj = nn.Linear(latent_dim, kv_fanout_len * self.hidden)
+            self.fanout_dropout = nn.Dropout(0.1)
+            logger.info(
+                "Fan-out via PREFIX (%d soft-prompt tokens) for RoPE decoder %s",
+                kv_fanout_len, model_name,
+            )
+        elif deep_inject:
+            # KV-mode: per-layer key/value memory. Fan-out (kv_fanout_len>0) →
+            # one pooled latent → kv_mem_len KV slots/layer; else per-token (1/token).
             self.n_layer = getattr(cfg, "n_layer", None) or cfg.num_hidden_layers
             n_head = getattr(cfg, "n_head", None) or cfg.num_attention_heads
             n_kv_head = getattr(cfg, "num_key_value_heads", None) or n_head
             self.n_kv_head = n_kv_head
             self.kv_head_dim = self.hidden // n_head
-            # Fan-out: project ONE latent vector into kv_mem_len KV slots/layer.
-            # Otherwise: project each latent token into 1 slot/layer (per-token).
             self.kv_proj = nn.Linear(
                 latent_dim,
                 self.n_layer * 2 * n_kv_head * self.kv_head_dim * self.kv_mem_len
                 if self.kv_fanout
                 else self.n_layer * 2 * n_kv_head * self.kv_head_dim,
             )
-            # Dropout on the (large) fan-out projection — guards overfit, as in
-            # LangVAE (sentence.py: nn.Dropout(p=0.1) on context_hidden).
             self.kv_dropout = nn.Dropout(0.1) if self.kv_fanout else None
-            # Guard: fan-out on a large decoder explodes kv_proj (n_layer ×
-            # n_kv_head × head_dim × M grows fast). Warn so a mis-set
-            # kv_fanout_len on Mistral/Llama is caught before OOM.
             kv_params = self.kv_proj.weight.numel()
             if kv_params > 1_500_000_000:
                 logger.warning(
@@ -178,22 +219,30 @@ class VAEDecoder(nn.Module):
                 )
             else:
                 logger.info("kv_proj: %.0fM params (kv_fanout_len=%d)", kv_params / 1e6, self.kv_mem_len)
-        else:
-            self.kv_proj = None
-            self.kv_dropout = None
 
     # ------------------------------------------------------------------
     def _input_embeddings(self) -> nn.Module:
         return self.lm.get_input_embeddings()
 
     def _prefix(self, z: torch.Tensor) -> torch.Tensor:
-        """``(B, K, latent_dim)`` → ``(B, K, hidden)`` prefix embeddings."""
+        """``(B, K, latent_dim)`` → ``(B, prefix_len, hidden)`` prefix embeddings.
+
+        Always emits the K latent soft-prompt tokens. In prefix-fan-out mode it
+        additionally fans the pooled latent into ``fanout_prefix_len`` extra
+        soft-prompt tokens (RoPE-safe: real input positions the decoder rotates
+        itself), so ``prefix_len = K + fanout_prefix_len``.
+        """
         if z.dim() != 3 or z.size(1) != self.num_latent_tokens:
             raise ValueError(
                 f"Decoder expects z of shape (B, {self.num_latent_tokens}, latent_dim); "
                 f"got {tuple(z.shape)}"
             )
-        prefix = self.latent_proj(z) + self.prefix_pos_embed
+        prefix = self.latent_proj(z) + self.prefix_pos_embed  # (B, K, H)
+        if self.prefix_fanout:
+            pooled = z.mean(dim=1)  # (B, latent_dim)
+            fan = self.fanout_dropout(self.fanout_prefix_proj(pooled))  # (B, M*H)
+            fan = fan.view(z.size(0), self.fanout_prefix_len, self.hidden)  # (B, M, H)
+            prefix = torch.cat([prefix, fan], dim=1)  # (B, K+M, H)
         return prefix.to(self.compute_dtype)  # match the (possibly bf16) LM
 
     def _context(self, z: torch.Tensor) -> torch.Tensor | None:
@@ -254,7 +303,7 @@ class VAEDecoder(nn.Module):
         z-prefix alone. ``mask_token_id`` is kept only as the on/off gate.
         """
         B, L = token_ids.shape
-        K = self.num_latent_tokens
+        P = self.prefix_len  # K (kv mode) or K + fan-out tokens (prefix mode)
 
         tok_emb = self._input_embeddings()(token_ids)  # (B, L, H)
         if self.training and word_dropout > 0.0 and mask_token_id is not None:
@@ -269,16 +318,16 @@ class VAEDecoder(nn.Module):
         if ctx is not None:
             tok_emb = tok_emb + ctx
 
-        prefix = self._prefix(z)  # (B, K, H)
-        inputs_embeds = torch.cat([prefix, tok_emb], dim=1)  # (B, K+L, H)
+        prefix = self._prefix(z)  # (B, P, H)
+        inputs_embeds = torch.cat([prefix, tok_emb], dim=1)  # (B, P+L, H)
 
         attn = torch.cat(
-            [torch.ones(B, K, dtype=mask.dtype, device=mask.device), mask], dim=1
+            [torch.ones(B, P, dtype=mask.dtype, device=mask.device), mask], dim=1
         )
-        past = self._past_kv(z)
+        past = self._past_kv(z)  # None in prefix-fan-out mode
         if past is not None:
             # kv_mem_len extra always-visible memory slots per layer (= K for
-            # per-token injection, = kv_fanout_len for fan-out); extend the mask.
+            # per-token injection, = kv_fanout_len for KV fan-out); extend the mask.
             M = self.kv_mem_len
             attn = torch.cat(
                 [torch.ones(B, M, dtype=mask.dtype, device=mask.device), attn], dim=1
@@ -289,10 +338,10 @@ class VAEDecoder(nn.Module):
             past_key_values=past,
             use_cache=past is not None,
         )
-        logits = out.logits  # (B, K+L, V)
-        # Position K-1 (last prefix token) predicts token 0; position K+i-1
+        logits = out.logits  # (B, P+L, V)
+        # Position P-1 (last prefix token) predicts token 0; position P+i-1
         # predicts token i. Slice the L positions that predict tokens 0..L-1.
-        return logits[:, K - 1 : K - 1 + L, :]
+        return logits[:, P - 1 : P - 1 + L, :]
 
     # ------------------------------------------------------------- generation
     @torch.no_grad()
@@ -309,14 +358,16 @@ class VAEDecoder(nn.Module):
 
         Recomputes ``[prefix | generated-so-far]`` each step (no KV-cache
         threading) so it is robust across transformers versions. At step 0 the
-        input is just the K-token prefix, and the logits at the last prefix
-        position predict the first token — exactly mirroring the teacher-forced
-        slice in :meth:`forward`.
+        input is just the ``prefix_len``-token prefix (K latent tokens, plus the
+        fan-out tokens in prefix mode), and the logits at the last prefix position
+        predict the first token — exactly mirroring the teacher-forced slice in
+        :meth:`forward`. In prefix-fan-out mode ``_past_kv`` returns None, so
+        ``attn_len`` reduces to ``inp.size(1)``.
         """
         B = z.size(0)
         device = z.device
         ctx = self._context(z)
-        prefix = self._prefix(z)  # (B, K, H)
+        prefix = self._prefix(z)  # (B, prefix_len, H)
         embed = self._input_embeddings()
 
         generated: list[torch.Tensor] = []

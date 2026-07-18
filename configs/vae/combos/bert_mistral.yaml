@@ -8,9 +8,9 @@ decoder:
   use_lora: false           # NO LoRA: fully frozen decoder + trainable injection only
   # (LangVAE's regime). Avoids the LoRA-on-big-decoder instability; also the "-LoRA"
   # ablation.
-  kv_fanout_len: 50         # FULL fan-out, like LangVAE (fair comparison). kv_proj
-  # here is ~423M params (GQA: 8 kv-heads × 128 head-dim × 32 layers × 50) — the
-  # SAME order as LangVAE's own W_m (~428M); trains fine on an A100-80GB.
+  kv_fanout_len: 50         # FULL fan-out, like LangVAE (fair comparison).
+  fanout_mode: prefix       # RoPE decoder (Mistral) → PREFIX soft-prompt fan-out,
+  # not raw KV (raw un-rotated KV is unreadable under RoPE).
   torch_dtype: bfloat16     # 7B in bf16 (~14GB) fits on an A100-80GB (and usually
   # 40GB). Injected tensors cast to bf16. If you OOM, set load_in_4bit: true
   # (QLoRA) — see combos/README.md for the .to(device) caveat.

@@ -59,6 +59,7 @@ class SequenceVAE(nn.Module):
             torch_dtype=config.decoder.torch_dtype,
             load_in_4bit=config.decoder.load_in_4bit,
             device_map=config.decoder.device_map,
+            fanout_mode=config.decoder.fanout_mode,
         )
 
         # Optional bag-of-words head over the DECODER vocabulary, predicted from

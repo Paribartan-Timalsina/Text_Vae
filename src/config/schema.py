@@ -75,6 +75,16 @@ class DecoderConfig:
     device_map: Optional[str] = None  # HF device_map for the decoder (e.g.
     # "auto" to shard a large model across GPUs). None keeps it on the default
     # device (the training loop's .to(device)).
+    fanout_mode: str = "auto"  # How the KV fan-out reaches the decoder:
+    # "kv" = raw per-layer key/value memory (past_key_values) — correct for
+    #        absolute-position decoders (GPT-2).
+    # "prefix" = the fan-out is projected into soft-prompt PREFIX embeddings
+    #        prepended to the input, so the model applies its OWN position
+    #        encoding to them — required for ROTARY (RoPE) decoders (Qwen/Llama/
+    #        Mistral), where raw un-rotated injected keys are misaligned with the
+    #        rotated queries and the latent becomes unreadable.
+    # "auto" = pick "prefix" if the decoder uses RoPE, else "kv". Only active when
+    #        deep_inject=True and kv_fanout_len>0.
 
 
 @dataclass(frozen=True)

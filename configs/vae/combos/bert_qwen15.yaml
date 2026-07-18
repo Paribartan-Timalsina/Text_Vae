@@ -9,8 +9,11 @@ decoder:
   model_name: Qwen/Qwen2.5-1.5B
   use_lora: true            # keep LoRA (your recipe) — Qwen uses q_proj/v_proj, which
   # the LoRA target selector already handles. Small model → stable at lr=1e-3.
-  kv_fanout_len: 50         # full fan-out. kv_proj ≈ 92M params (GQA: 2 kv-heads ×
-  # 128 head-dim × 28 layers × 50) — tiny; trains easily.
+  kv_fanout_len: 50         # full fan-out (M read-points into z).
+  fanout_mode: prefix       # RoPE decoder (Qwen) → route the fan-out through
+  # PREFIX soft-prompt embeddings, not raw KV. Raw KV is un-rotated and misaligns
+  # with RoPE's rotated queries → latent unreadable. Prefix tokens are real
+  # positions the model rotates itself. ("auto" would also pick this.)
   torch_dtype: float32      # 1.5B in fp32 fits fine on an A100 and matches the GPT-2
   # combo's precision (no bf16 confound). Switch to bfloat16 if you want it lighter.
 vae_training:
