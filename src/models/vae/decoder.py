@@ -34,6 +34,27 @@ def _lora_target_modules(model_name: str) -> list[str]:
     return ["q_proj", "v_proj"]
 
 
+def _rotate_half(x: "torch.Tensor") -> "torch.Tensor":
+    """Rotate the last dim by half (RoPE convention, matches transformers)."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def _find_rotary_emb(module: nn.Module):
+    """Recursively find the first ``rotary_emb`` submodule (works through the
+    PEFT/LoRA wrapper; all layers share one rotary in modern transformers).
+    Returns None if not found."""
+    rot = getattr(module, "rotary_emb", None)
+    if rot is not None:
+        return rot
+    for child in module.children():
+        found = _find_rotary_emb(child)
+        if found is not None:
+            return found
+    return None
+
+
 def _decoder_uses_rope(cfg) -> bool:
     """True if the decoder uses rotary position embeddings (RoPE).
 
@@ -174,6 +195,26 @@ class VAEDecoder(nn.Module):
         elif fanout_mode not in ("kv", "prefix"):
             raise ValueError(f"fanout_mode must be auto/kv/prefix; got {fanout_mode!r}")
 
+        # RoPE + kv mode: the injected keys must be rotated to their cache
+        # positions to align with the decoder's rotated queries (raw un-rotated
+        # keys are unreadable under RoPE). Fetch the model's own rotary module
+        # (handles rope_scaling correctly); if it can't be found, fall back to the
+        # safe prefix path. Stored in a list so nn.Module doesn't re-register it.
+        self.rope_kv = False
+        self._rotary_emb: list = []
+        if resolved_mode == "kv" and _decoder_uses_rope(cfg):
+            rot = _find_rotary_emb(self.lm)
+            if rot is not None:
+                self.rope_kv = True
+                self._rotary_emb = [rot]
+                logger.info("RoPE-aware KV fan-out enabled for %s", model_name)
+            else:
+                logger.warning(
+                    "RoPE decoder %s: rotary_emb not found; falling back to prefix "
+                    "fan-out (KV injection would be unreadable).", model_name,
+                )
+                resolved_mode = "prefix"
+
         self.kv_fanout = deep_inject and kv_fanout_len > 0 and resolved_mode == "kv"
         self.prefix_fanout = deep_inject and kv_fanout_len > 0 and resolved_mode == "prefix"
         # KV memory length (only meaningful in kv mode); prefix length includes
@@ -273,6 +314,20 @@ class VAEDecoder(nn.Module):
             kv = kv.view(B, K, self.n_layer, 2, self.n_kv_head, self.kv_head_dim)
             kv = kv.permute(2, 3, 0, 4, 1, 5)  # (n_layer, 2, B, n_kv_head, K, hd)
         kv = kv.to(self.compute_dtype)  # match the (possibly bf16) LM attention
+        if self.rope_kv:
+            # RoPE decoders rotate keys/queries by position. Our injected keys are
+            # raw; rotate them to their cache positions 0..M-1 (the decoder auto-
+            # positions the real tokens at M..) so they align with the rotated
+            # queries. Only KEYS are rotated (RoPE never touches values). cos/sin
+            # come from the model's own rotary module (handles rope_scaling).
+            Mlen = kv.shape[4]
+            pos = torch.arange(Mlen, device=kv.device).unsqueeze(0)  # (1, M)
+            cos, sin = self._rotary_emb[0](kv, pos)  # (1, M, head_dim)
+            cos = cos[0].to(kv.dtype)  # (M, head_dim) — broadcasts over layer/B/head
+            sin = sin[0].to(kv.dtype)
+            keys = kv[:, 0]  # (n_layer, B, n_kv_head, M, head_dim)
+            keys = keys * cos + _rotate_half(keys) * sin
+            kv = torch.stack([keys, kv[:, 1]], dim=1)  # rebuild (n_layer, 2, ...)
         layers = tuple(
             (kv[layer][0].contiguous(), kv[layer][1].contiguous())
             for layer in range(self.n_layer)

@@ -9,8 +9,9 @@ decoder:
   # (LangVAE's regime). Avoids the LoRA-on-big-decoder instability; also the "-LoRA"
   # ablation.
   kv_fanout_len: 50         # FULL fan-out, like LangVAE (fair comparison).
-  fanout_mode: prefix       # RoPE decoder (Mistral) → PREFIX soft-prompt fan-out,
-  # not raw KV (raw un-rotated KV is unreadable under RoPE).
+  fanout_mode: kv           # RoPE-AWARE per-layer KV (injected keys rotated to their
+  # cache positions). High bandwidth like GPT-2/LangVAE. kv_proj ≈ 423M (GQA: 8
+  # kv-heads × 128 head-dim × 32 layers × 50) — same order as LangVAE's W_m (~428M).
   torch_dtype: bfloat16     # 7B in bf16 (~14GB) fits on an A100-80GB (and usually
   # 40GB). Injected tensors cast to bf16. If you OOM, set load_in_4bit: true
   # (QLoRA) — see combos/README.md for the .to(device) caveat.
