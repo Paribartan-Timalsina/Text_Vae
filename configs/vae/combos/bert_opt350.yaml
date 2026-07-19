@@ -1,0 +1,19 @@
+# Combo: BERT encoder + OPT-350m decoder.
+# Layer OVER base.yaml + default.yaml. OPT is a DIFFERENT family from GPT-2 but
+# shares the property that makes injection work: LEARNED ABSOLUTE positions (no
+# RoPE). So it uses the working raw-KV path (fanout_mode auto -> kv), full recipe
+# (LoRA on, lr=1e-3) like GPT-2. Open (no HF login). Small (350M) — the cheap test
+# of whether a genuinely different working family holds up before scaling to OPT-1.3b.
+#
+# Note: OPT-350m's token-embedding dim (512) differs from hidden (1024); the decoder
+# injects prefix/context at embed_dim and KV at hidden (handled automatically).
+encoder:
+  model_name: bert-base-cased
+decoder:
+  model_name: facebook/opt-350m
+  use_lora: true
+  kv_fanout_len: 50         # raw-KV fan-out (absolute positions → no rotation needed).
+  torch_dtype: float32      # 350M fits easily in fp32; matches the GPT-2 recipe.
+vae_training:
+  dataset: entailment_bank
+  batch_size: 32            # 350M + LoRA + zforce pass; comfortable on an A100.

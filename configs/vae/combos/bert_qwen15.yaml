@@ -9,12 +9,11 @@ decoder:
   model_name: Qwen/Qwen2.5-1.5B
   use_lora: true            # keep LoRA (your recipe) — Qwen uses q_proj/v_proj, which
   # the LoRA target selector already handles. Small model → stable at lr=1e-3.
-  kv_fanout_len: 50         # full fan-out (M KV read-points into z per layer).
-  fanout_mode: kv           # RoPE-AWARE per-layer KV: inject M key/value slots per
-  # layer (high bandwidth, like GPT-2/LangVAE) with the injected KEYS rotated to
-  # their cache positions so they align with RoPE's rotated queries. kv_proj ≈ 92M
-  # (GQA: 2 kv-heads × 128 head-dim × 28 layers × 50). ("prefix" is the lower-
-  # bandwidth fallback; it worked but capped BLEU near 0.)
+  kv_fanout_len: 50         # fan-out (M read-points into z).
+  fanout_mode: prefix       # EMPIRICAL: on Qwen, prefix beat the RoPE-aware "kv"
+  # path at matched steps (BLEU ~4.0 vs ~2.7 @ 4k; f1 tied). The kv path's ~92M
+  # kv_proj (vs prefix's ~10M) optimizes slower/noisier and didn't pay off within
+  # budget. "kv" is RoPE-correct (verified) and available if you train much longer.
   torch_dtype: float32      # 1.5B in fp32 fits fine on an A100 and matches the GPT-2
   # combo's precision (no bf16 confound). Switch to bfloat16 if you want it lighter.
 vae_training:

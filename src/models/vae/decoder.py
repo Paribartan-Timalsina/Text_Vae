@@ -159,23 +159,28 @@ class VAEDecoder(nn.Module):
         cfg = lm.config
         self.hidden = cfg.hidden_size
         self.vocab_size = cfg.vocab_size
+        # INPUT-embedding dim — usually == hidden, but a few models differ (e.g.
+        # OPT-350m: token embeddings are 512, projected up to hidden=1024). The
+        # input-layer injections (prefix/context/mask) must match the embedding the
+        # decoder consumes as `inputs_embeds`; the KV injection uses `hidden`.
+        self.embed_dim = self._input_embeddings().weight.shape[1]
 
         # --- Trained latent-injection layers ---
-        # K latent vectors → K prefix embeddings at the LM hidden size.
-        self.latent_proj = nn.Linear(latent_dim, self.hidden)
+        # K latent vectors → K prefix embeddings at the input-embedding size.
+        self.latent_proj = nn.Linear(latent_dim, self.embed_dim)
         # Learnable positional embedding distinguishing the K prefix slots.
         self.prefix_pos_embed = nn.Parameter(
-            torch.randn(1, num_latent_tokens, self.hidden) * 0.02
+            torch.randn(1, num_latent_tokens, self.embed_dim) * 0.02
         )
         # Learned "blank" embedding used to replace word-dropped INPUT tokens
         # (cleaner than random vocab ids: a neutral mask, not misleading noise).
         # At high word_dropout this makes teacher forcing behave like a masked
         # autoencoder so the decoder must reconstruct from z.
-        self.mask_embed = nn.Parameter(torch.randn(1, 1, self.hidden) * 0.02)
+        self.mask_embed = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
         # Per-position injection: a single K-pooled context vector added to
         # every token embedding so z is reachable at each decode step.
         if latent_pos_inject:
-            self.latent_context_proj = nn.Linear(latent_dim, self.hidden)
+            self.latent_context_proj = nn.Linear(latent_dim, self.embed_dim)
         else:
             self.latent_context_proj = None
 
@@ -229,8 +234,8 @@ class VAEDecoder(nn.Module):
         self.fanout_dropout = None
 
         if self.prefix_fanout:
-            # RoPE-safe fan-out: pool z → M prefix embeddings (M×hidden — tiny).
-            self.fanout_prefix_proj = nn.Linear(latent_dim, kv_fanout_len * self.hidden)
+            # RoPE-safe fan-out: pool z → M prefix embeddings (M×embed_dim — tiny).
+            self.fanout_prefix_proj = nn.Linear(latent_dim, kv_fanout_len * self.embed_dim)
             self.fanout_dropout = nn.Dropout(0.1)
             logger.info(
                 "Fan-out via PREFIX (%d soft-prompt tokens) for RoPE decoder %s",
@@ -281,8 +286,8 @@ class VAEDecoder(nn.Module):
         prefix = self.latent_proj(z) + self.prefix_pos_embed  # (B, K, H)
         if self.prefix_fanout:
             pooled = z.mean(dim=1)  # (B, latent_dim)
-            fan = self.fanout_dropout(self.fanout_prefix_proj(pooled))  # (B, M*H)
-            fan = fan.view(z.size(0), self.fanout_prefix_len, self.hidden)  # (B, M, H)
+            fan = self.fanout_dropout(self.fanout_prefix_proj(pooled))  # (B, M*embed_dim)
+            fan = fan.view(z.size(0), self.fanout_prefix_len, self.embed_dim)  # (B, M, embed_dim)
             prefix = torch.cat([prefix, fan], dim=1)  # (B, K+M, H)
         return prefix.to(self.compute_dtype)  # match the (possibly bf16) LM
 

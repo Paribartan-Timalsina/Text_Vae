@@ -8,10 +8,10 @@ decoder:
   use_lora: false           # NO LoRA: fully frozen decoder + trainable injection only
   # (LangVAE's exact regime). LoRA on a 3B decoder at batch 8 diverged; dropping it
   # removes the instability. This run is also the "-LoRA" ablation.
-  kv_fanout_len: 50         # FULL fan-out, like LangVAE (fair comparison).
-  fanout_mode: kv           # RoPE-AWARE per-layer KV (injected keys rotated to their
-  # cache positions). High bandwidth like GPT-2/LangVAE. kv_proj ≈ 370M (GQA: 8
-  # kv-heads × 128 head-dim × 28 layers × 50) — same order as LangVAE's W_m.
+  kv_fanout_len: 50         # fan-out (M read-points into z).
+  fanout_mode: prefix       # RoPE-safe prefix fan-out. On Qwen, prefix beat the
+  # RoPE-aware "kv" path at matched budget, so it's the default here too. Switch to
+  # "kv" (RoPE-correct, verified; kv_proj ~370M) only for a long-training ablation.
   torch_dtype: bfloat16     # 3B in bf16 (~6GB) fits comfortably on an A100; the
   # injected latent tensors are cast to bf16 to match. Works with the pipeline's
   # .to(device). For a smaller GPU set load_in_4bit: true (see combos/README.md).
