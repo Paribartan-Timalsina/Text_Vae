@@ -20,3 +20,9 @@ vae_training:
   dataset: entailment_bank
   batch_size: 32            # 1.5B + LoRA + zforce pass; 32 is a solid A100 default
   # (bump to 50 to match the GPT-2 combo if memory allows, or add grad_accum_steps).
+  word_dropout: 0.9         # STRONG z-forcing (was 0.7): blank 90% of gold input
+  # tokens so the big Qwen can't lean on the teacher-forcing crutch and MUST read z
+  # (a cheap, parallel stand-in for free-running). 0.9 not 1.0 keeps a thin
+  # autoregressive signal and keeps the zforce pass meaningful.
+  zforce_weight: 1.0        # (was 0.5) full-weight z-only auxiliary pass — a second
+  # decode with all inputs blanked, forcing reconstruction from z alone.
