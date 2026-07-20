@@ -131,6 +131,50 @@ def compute_bow_loss(
     return nll
 
 
+def compute_consistency_loss(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    mask: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Self-distillation consistency loss (Hinton et al. 2015, intra-model).
+
+    Distills a fluent *teacher* pass into a *student* pass by pulling the
+    student's full output distribution toward the teacher's. In this VAE the
+    teacher is the (gold-context) main decode and the student is the z-only
+    decode (all inputs masked), so minimizing this forces *z* to carry enough
+    of the sentence to reproduce the teacher's fluent predictions — a richer
+    signal than matching the hard gold token (cf. ``zforce``).
+
+    The teacher is detached here so gradients flow ONLY into the student; the
+    teacher cannot be dragged down to meet the student (which would be the
+    trivial degenerate solution).
+
+    Parameters
+    ----------
+    teacher_logits : (B, L, V) — teacher pass logits (detached internally).
+    student_logits : (B, L, V) — student pass logits (receives the gradient).
+    mask : (B, L) — 1 for real tokens, 0 for padding.
+    temperature : float — softmax temperature T. T>1 softens both distributions
+        (exposes more relative "dark knowledge"); the loss is scaled by T^2 so
+        its gradient magnitude stays comparable across T.
+
+    Returns
+    -------
+    Scalar KL(teacher || student), summed over the vocabulary and over real
+    tokens per sequence, then averaged over the batch — the same reduction as
+    the reconstruction term, so the consistency weight is comparable to recon.
+    """
+    B = teacher_logits.size(0)
+    T = temperature
+    teacher = F.softmax(teacher_logits.detach() / T, dim=-1)  # (B, L, V)
+    teacher_logp = torch.log(teacher.clamp_min(1e-9))
+    student_logp = F.log_softmax(student_logits / T, dim=-1)
+    # KL(teacher || student) per token, summed over vocab.
+    kl_tok = (teacher * (teacher_logp - student_logp)).sum(dim=-1)  # (B, L)
+    return (kl_tok * mask.float()).sum() / B * (T * T)
+
+
 def compute_beta(
     step: int,
     start: float,

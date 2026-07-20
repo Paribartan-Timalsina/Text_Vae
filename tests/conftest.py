@@ -67,6 +67,7 @@ class FakeVAE(nn.Module):
         free_bits: float = 0.0, target_kl=None, recon_weights=None,
         bow_weight: float = 0.0, zforce_weight: float = 0.0,
         word_dropout: float = 0.0, mask_token_id=None, noise_aug_sigma: float = 0.0,
+        consistency_weight: float = 0.0, consistency_temp: float = 1.0,
     ):
         from src.models.vae.loss import compute_vae_loss
 
@@ -79,7 +80,7 @@ class FakeVAE(nn.Module):
         zero = total.new_zeros(())
         return logits, z, mu, log_var, {
             "total": total, "recon": recon, "kl": kl,
-            "bow": zero, "recon_zonly": zero,
+            "bow": zero, "recon_zonly": zero, "consistency": zero,
         }
 
     def decode_to_tokens(self, z, strategy: str = "greedy", max_len=None,

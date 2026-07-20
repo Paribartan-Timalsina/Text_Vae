@@ -314,6 +314,7 @@ def train_vae(
             "kl": 0.0,
             "bow": 0.0,
             "recon_zonly": 0.0,
+            "consistency": 0.0,
             "true_kl": 0.0,
             "grad_norm": 0.0,
             "mu_mean": 0.0,
@@ -395,6 +396,8 @@ def train_vae(
                 mask_token_id=word_dropout_id,
                 bow_weight=tc.bow_loss_weight,
                 zforce_weight=tc.zforce_weight,
+                consistency_weight=tc.consistency_weight,
+                consistency_temp=tc.consistency_temp,
             )
             loss = loss_dict["total"] / tc.grad_accum_steps
             loss.backward()
@@ -429,6 +432,7 @@ def train_vae(
                 "kl": loss_dict["kl"].item(),
                 "bow": loss_dict["bow"].item(),
                 "recon_zonly": loss_dict["recon_zonly"].item(),
+                "consistency": loss_dict["consistency"].item(),
                 "true_kl": true_kl,
                 "grad_norm": grad_norm,
                 "mu_mean": mu.mean().item(),
@@ -460,6 +464,7 @@ def train_vae(
                     "train/kl": step_metrics["kl"],
                     "train/bow": step_metrics["bow"],
                     "train/recon_zonly": step_metrics["recon_zonly"],
+                    "train/consistency": step_metrics["consistency"],
                     "train/true_kl": step_metrics["true_kl"],
                     "train/grad_norm": step_metrics["grad_norm"],
                     "train/beta": beta,

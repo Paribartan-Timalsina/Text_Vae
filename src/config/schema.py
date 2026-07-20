@@ -186,6 +186,20 @@ class VAETrainingConfig:
     # cure for the teacher-forced/generation gap (good train recon, EM/F1 ~0).
     # Added to total like a second recon term (same reduction), so the weight is
     # comparable to recon. 0.0 disables. Requires a mask token id (BERT [MASK]).
+    consistency_weight: float = 0.0  # Weight on the self-distillation consistency
+    # loss (Hinton et al. 2015, applied intra-model). Distills the fluent MAIN
+    # (teacher-forced) pass into the z-only pass: KL(stopgrad(softmax(main_logits))
+    # || softmax(zonly_logits)), reusing the SAME z-only forward as zforce (no extra
+    # pass). Where zforce_weight matches the z-only pass to the HARD gold token, this
+    # matches it to the teacher's FULL soft distribution — a far richer signal that
+    # forces z to carry enough of the sentence to reproduce the teacher's fluency.
+    # For a meaningful teacher, keep the main pass's word_dropout low (e.g. 0.3) so
+    # it has real gold context. Same reduction as recon, so comparable to recon/
+    # zforce weights. 0.0 disables. Requires a mask token id (BERT [MASK]).
+    consistency_temp: float = 1.0  # Softmax temperature T for the consistency loss.
+    # T=1.0 = raw distributions; T>1 softens both, exposing more "dark knowledge"
+    # (relative weights of plausible tokens). The loss is scaled by T^2 (standard
+    # distillation scaling) so its gradient magnitude stays comparable across T.
 
 
 @dataclass(frozen=True)

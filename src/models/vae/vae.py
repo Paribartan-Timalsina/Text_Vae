@@ -15,7 +15,7 @@ from src.config.schema import Config
 from .encoder import VAEEncoder
 from .decoder import VAEDecoder
 from .reparameterize import reparameterize
-from .loss import compute_vae_loss, compute_bow_loss
+from .loss import compute_vae_loss, compute_bow_loss, compute_consistency_loss
 
 
 class SequenceVAE(nn.Module):
@@ -111,6 +111,8 @@ class SequenceVAE(nn.Module):
         mask_token_id: int | None = None,
         bow_weight: float = 0.0,
         zforce_weight: float = 0.0,
+        consistency_weight: float = 0.0,
+        consistency_temp: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Full forward pass (teacher-forced).
 
@@ -139,22 +141,37 @@ class SequenceVAE(nn.Module):
             bow = compute_bow_loss(bow_logits, dec_ids, dec_mask)
             total = total + bow_weight * bow
 
+        # z-only auxiliary pass — a SECOND decode of the same decoder with every
+        # input token masked (word_dropout=1.0), so it must reconstruct from z alone.
+        # Reused by BOTH z-forcing (hard-gold target) and consistency distillation
+        # (soft teacher target), so it runs at most ONCE per step.
         recon_zonly = total.new_zeros(())
-        if zforce_weight > 0.0 and self.training and mask_token_id is not None:
+        consistency = total.new_zeros(())
+        want_zonly = (zforce_weight > 0.0 or consistency_weight > 0.0)
+        if want_zonly and self.training and mask_token_id is not None:
             zonly_logits = self.decode(
                 dec_ids, z_decode, dec_mask,
                 word_dropout=1.0, mask_token_id=mask_token_id,
             )
-            _, recon_zonly, _ = compute_vae_loss(
-                zonly_logits, dec_ids, dec_mask, mu, log_var,
-                beta=0.0, free_bits=0.0, target_kl=None,
-                recon_weights=recon_weights,
-            )
-            total = total + zforce_weight * recon_zonly
+            if zforce_weight > 0.0:
+                _, recon_zonly, _ = compute_vae_loss(
+                    zonly_logits, dec_ids, dec_mask, mu, log_var,
+                    beta=0.0, free_bits=0.0, target_kl=None,
+                    recon_weights=recon_weights,
+                )
+                total = total + zforce_weight * recon_zonly
+            if consistency_weight > 0.0:
+                # Distill the fluent MAIN pass (teacher) into the z-only pass
+                # (student): KL(teacher || student). Teacher is detached inside the
+                # helper, so gradients flow only into the z-only path.
+                consistency = compute_consistency_loss(
+                    logits, zonly_logits, dec_mask, temperature=consistency_temp,
+                )
+                total = total + consistency_weight * consistency
 
         loss_dict = {
             "total": total, "recon": recon, "kl": kl,
-            "bow": bow, "recon_zonly": recon_zonly,
+            "bow": bow, "recon_zonly": recon_zonly, "consistency": consistency,
         }
         return logits, z, mu, log_var, loss_dict
 

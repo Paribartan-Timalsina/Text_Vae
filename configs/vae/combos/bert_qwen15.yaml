@@ -20,9 +20,16 @@ vae_training:
   dataset: entailment_bank
   batch_size: 32            # 1.5B + LoRA + zforce pass; 32 is a solid A100 default
   # (bump to 50 to match the GPT-2 combo if memory allows, or add grad_accum_steps).
-  word_dropout: 0.9         # STRONG z-forcing (was 0.7): blank 90% of gold input
-  # tokens so the big Qwen can't lean on the teacher-forcing crutch and MUST read z
-  # (a cheap, parallel stand-in for free-running). 0.9 not 1.0 keeps a thin
-  # autoregressive signal and keeps the zforce pass meaningful.
-  zforce_weight: 1.0        # (was 0.5) full-weight z-only auxiliary pass — a second
-  # decode with all inputs blanked, forcing reconstruction from z alone.
+  word_dropout: 0.3         # LOWERED (was 0.9) for the consistency recipe: the MAIN
+  # pass is now the TEACHER for self-distillation, so it needs real gold context to
+  # be fluent. z-forcing no longer comes from starving the main pass — it comes from
+  # the z-only pass (zforce) + the consistency term below.
+  zforce_weight: 1.0        # keep the HARD-gold z-only anchor (a second decode with
+  # all inputs blanked, reconstructing from z alone).
+  consistency_weight: 1.0   # NEW — self-distillation z-forcing. Distills the fluent
+  # main pass into the z-only pass: KL(stopgrad(softmax(main)) || softmax(zonly)),
+  # reusing the SAME z-only forward as zforce (no extra pass). Matches the z-only
+  # pass to the teacher's FULL distribution (richer than the hard gold token) so z
+  # must carry enough to reproduce the teacher's fluency. Sweep 0.5/1.0/2.0.
+  consistency_temp: 1.0     # softmax temperature; try 2.0 to expose more soft
+  # structure ("dark knowledge") if 1.0 is too weak.
