@@ -122,6 +122,30 @@ def test_forward_generate_first_token_parity(deep_inject):
     assert torch.equal(fwd_logits[:, 0, :].argmax(dim=-1), gen[:, 0])
 
 
+def test_prefix_inject_false_severs_z_but_keeps_shape():
+    """prefix_inject=False must keep the K prefix positions (shape unchanged)
+    but make them ignore z, so this channel can be ablated independently of
+    latent_pos_inject/deep_inject."""
+    torch.manual_seed(0)
+    dec = VAEDecoder(
+        model_name="gpt2",
+        latent_dim=LATENT_DIM,
+        num_latent_tokens=K,
+        max_answer_len=L,
+        prefix_inject=False,
+        latent_pos_inject=False,
+        use_lora=False,
+        deep_inject=False,
+    ).eval()
+    z, ids, mask = make_batch()
+    z2 = torch.randn_like(z)
+    with torch.no_grad():
+        logits_a = dec(ids, z, mask)
+        logits_b = dec(ids, z2, mask)
+    assert logits_a.shape == (B, L, VOCAB)
+    assert torch.allclose(logits_a, logits_b, atol=1e-6)
+
+
 def test_generate_respects_eos():
     dec = make_decoder(True).eval()
     z, _, _ = make_batch()

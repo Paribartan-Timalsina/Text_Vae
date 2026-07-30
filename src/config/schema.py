@@ -40,6 +40,11 @@ class DecoderConfig:
 
     model_name: str = "gpt2"  # HuggingFace causal-LM id used as the generator.
     max_answer_len: int = 50  # Max decoder tokens (reconstruction length).
+    prefix_inject: bool = True  # Route z into the K soft-prompt PREFIX tokens
+    # (latent_proj(z) + prefix_pos_embed). False = ablation: the K prefix
+    # positions stay (architecture/shape unchanged) but carry no z-dependent
+    # info (prefix_pos_embed only) — isolates the prefix injection channel for
+    # leave-one-out ablation against latent_pos_inject/deep_inject.
     latent_pos_inject: bool = True  # Add a K-pooled projection of z to EVERY
     # decoder token embedding (not just the K-token prefix). Keeps z reachable at
     # every step so the frozen decoder cannot ignore it.

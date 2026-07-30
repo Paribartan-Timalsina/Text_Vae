@@ -99,6 +99,7 @@ class VAEDecoder(nn.Module):
         latent_dim: int,
         num_latent_tokens: int,
         max_answer_len: int,
+        prefix_inject: bool = True,
         latent_pos_inject: bool = True,
         use_lora: bool = False,
         lora_r: int = 16,
@@ -114,6 +115,7 @@ class VAEDecoder(nn.Module):
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
         self.max_answer_len = max_answer_len
+        self.prefix_inject = prefix_inject
         self.latent_pos_inject = latent_pos_inject
 
         # Compute dtype for the LM (and the dtype the injected latent tensors are
@@ -273,17 +275,24 @@ class VAEDecoder(nn.Module):
     def _prefix(self, z: torch.Tensor) -> torch.Tensor:
         """``(B, K, latent_dim)`` → ``(B, prefix_len, hidden)`` prefix embeddings.
 
-        Always emits the K latent soft-prompt tokens. In prefix-fan-out mode it
-        additionally fans the pooled latent into ``fanout_prefix_len`` extra
-        soft-prompt tokens (RoPE-safe: real input positions the decoder rotates
-        itself), so ``prefix_len = K + fanout_prefix_len``.
+        Always emits K soft-prompt positions (shape/architecture unchanged for
+        the ablation). When ``prefix_inject`` is True they carry
+        ``latent_proj(z) + prefix_pos_embed``; when False they carry only the
+        learned ``prefix_pos_embed`` bias (no z-dependence) so this injection
+        channel is cleanly isolated from embedding/KV injection. In prefix-fan-out
+        mode it additionally fans the pooled latent into ``fanout_prefix_len``
+        extra soft-prompt tokens (RoPE-safe: real input positions the decoder
+        rotates itself), so ``prefix_len = K + fanout_prefix_len``.
         """
         if z.dim() != 3 or z.size(1) != self.num_latent_tokens:
             raise ValueError(
                 f"Decoder expects z of shape (B, {self.num_latent_tokens}, latent_dim); "
                 f"got {tuple(z.shape)}"
             )
-        prefix = self.latent_proj(z) + self.prefix_pos_embed  # (B, K, H)
+        if self.prefix_inject:
+            prefix = self.latent_proj(z) + self.prefix_pos_embed  # (B, K, H)
+        else:
+            prefix = self.prefix_pos_embed.expand(z.size(0), -1, -1)  # (B, K, H)
         if self.prefix_fanout:
             pooled = z.mean(dim=1)  # (B, latent_dim)
             fan = self.fanout_dropout(self.fanout_prefix_proj(pooled))  # (B, M*embed_dim)

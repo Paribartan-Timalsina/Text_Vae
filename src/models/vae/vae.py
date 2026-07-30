@@ -49,6 +49,7 @@ class SequenceVAE(nn.Module):
             latent_dim=arch.latent_dim,
             num_latent_tokens=arch.num_latent_tokens,
             max_answer_len=config.decoder.max_answer_len,
+            prefix_inject=config.decoder.prefix_inject,
             latent_pos_inject=config.decoder.latent_pos_inject,
             use_lora=config.decoder.use_lora,
             lora_r=config.decoder.lora_r,
