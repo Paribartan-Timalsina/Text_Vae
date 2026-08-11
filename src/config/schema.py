@@ -93,6 +93,27 @@ class DecoderConfig:
     # "auto" = pick "prefix" if the decoder uses RoPE, else "kv" (safe default).
     #        RoPE combos set "kv" explicitly to use the RoPE-aware per-layer path.
     #        Only active when deep_inject=True and kv_fanout_len>0.
+    split_latent_channels: bool = False  # Partition the shared latent_dim into 3
+    # disjoint slices — one per injection channel (prefix, embedding, KV) —
+    # instead of feeding the full z to all three. Total latent budget stays ==
+    # latent_dim (matched to LangVAE's budget, no capacity added); each channel
+    # gets its own dims so it cannot just copy another channel's signal. Tests
+    # whether the 3-channel design adds real complementary information vs three
+    # redundant views of the same vector. Only active when split_latent_channels
+    # is True; the split sizes come from channel_split_dims (or an even 3-way
+    # split of latent_dim if that is left unset).
+    channel_split_dims: Optional[tuple[int, int, int]] = None  # Explicit
+    # (prefix_dim, embed_dim, kv_dim) sizes for split_latent_channels — must sum
+    # to <= latent_dim. None = even 3-way split. e.g. (48, 48, 32) on
+    # latent_dim=128 gives KV a smaller dedicated slice (matches the earlier
+    # (K=1, latent_dim=32) config that already scored well standalone) and
+    # splits the rest evenly across prefix/embedding.
+    deep_embed_inject: bool = False  # Per-layer embedding-channel injection: a
+    # learned projection of z added to EVERY decoder layer's hidden state (via
+    # forward hooks), not just the input token embeddings. Gives the embedding
+    # channel the same per-layer reach as deep_inject already gives KV, since
+    # the plain latent_pos_inject path is single-shot at the input layer and
+    # must survive the residual stream unaided.
 
 
 @dataclass(frozen=True)

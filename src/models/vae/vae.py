@@ -61,6 +61,9 @@ class SequenceVAE(nn.Module):
             load_in_4bit=config.decoder.load_in_4bit,
             device_map=config.decoder.device_map,
             fanout_mode=config.decoder.fanout_mode,
+            split_latent_channels=config.decoder.split_latent_channels,
+            channel_split_dims=config.decoder.channel_split_dims,
+            deep_embed_inject=config.decoder.deep_embed_inject,
         )
 
         # Optional bag-of-words head over the DECODER vocabulary, predicted from
