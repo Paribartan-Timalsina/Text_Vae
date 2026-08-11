@@ -74,6 +74,26 @@ def _decoder_uses_rope(cfg) -> bool:
     }
 
 
+def _find_decoder_layers(lm: nn.Module) -> nn.ModuleList:
+    """Locate the transformer block list on a causal LM (post-LoRA-wrap safe).
+
+    Unwraps a PEFT wrapper via ``get_base_model`` first, then checks the
+    attribute paths used by the supported decoder families: GPT-2
+    (``transformer.h``), Llama/Qwen/Mistral (``model.layers``), OPT
+    (``model.decoder.layers``).
+    """
+    base = lm.get_base_model() if hasattr(lm, "get_base_model") else lm
+    for path in ("transformer.h", "model.layers", "model.decoder.layers"):
+        obj = base
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if isinstance(obj, nn.ModuleList):
+            return obj
+    raise ValueError(f"Could not locate decoder transformer layers on {type(lm).__name__}")
+
+
 def _build_cache(layers: tuple) -> object:
     """Wrap legacy ``((k, v), ...)`` layers in a ``Cache`` object when the
     installed transformers requires it; fall back to the raw tuple."""
@@ -111,12 +131,46 @@ class VAEDecoder(nn.Module):
         load_in_4bit: bool = False,
         device_map: str | None = None,
         fanout_mode: str = "auto",
+        split_latent_channels: bool = False,
+        channel_split_dims: tuple[int, int, int] | None = None,
+        deep_embed_inject: bool = False,
     ) -> None:
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
         self.max_answer_len = max_answer_len
         self.prefix_inject = prefix_inject
         self.latent_pos_inject = latent_pos_inject
+
+        # Per-channel latent slices. Off (default): all three channels read the
+        # full shared z (current/legacy behaviour). On: z is partitioned into 3
+        # disjoint slices summing to latent_dim (no budget added — stays matched
+        # to LangVAE) so prefix/embedding/KV each get a dedicated sub-vector
+        # instead of three redundant views of the same one.
+        self.split_latent_channels = split_latent_channels
+        if split_latent_channels:
+            if channel_split_dims is not None:
+                d0, d1, d2 = channel_split_dims
+                if d0 + d1 + d2 > latent_dim:
+                    raise ValueError(
+                        f"channel_split_dims {channel_split_dims} sums to "
+                        f"{d0 + d1 + d2} > latent_dim {latent_dim}"
+                    )
+            else:
+                base, rem = divmod(latent_dim, 3)
+                d0 = base + (1 if rem > 0 else 0)
+                d1 = base + (1 if rem > 1 else 0)
+                d2 = base
+            self.z_prefix_dim, self.z_embed_dim, self.z_kv_dim = d0, d1, d2
+            self._z_prefix_sl = slice(0, d0)
+            self._z_embed_sl = slice(d0, d0 + d1)
+            self._z_kv_sl = slice(d0 + d1, d0 + d1 + d2)
+            logger.info(
+                "Split latent channels: prefix=%d embed=%d kv=%d (latent_dim=%d)",
+                d0, d1, d2, latent_dim,
+            )
+        else:
+            self.z_prefix_dim = self.z_embed_dim = self.z_kv_dim = latent_dim
+            self._z_prefix_sl = self._z_embed_sl = self._z_kv_sl = slice(0, latent_dim)
 
         # Compute dtype for the LM (and the dtype the injected latent tensors are
         # cast to). bfloat16/float16 keep large decoders (Mistral/Llama) in memory;
@@ -169,7 +223,7 @@ class VAEDecoder(nn.Module):
 
         # --- Trained latent-injection layers ---
         # K latent vectors → K prefix embeddings at the input-embedding size.
-        self.latent_proj = nn.Linear(latent_dim, self.embed_dim)
+        self.latent_proj = nn.Linear(self.z_prefix_dim, self.embed_dim)
         # Learnable positional embedding distinguishing the K prefix slots.
         self.prefix_pos_embed = nn.Parameter(
             torch.randn(1, num_latent_tokens, self.embed_dim) * 0.02
@@ -182,7 +236,7 @@ class VAEDecoder(nn.Module):
         # Per-position injection: a single K-pooled context vector added to
         # every token embedding so z is reachable at each decode step.
         if latent_pos_inject:
-            self.latent_context_proj = nn.Linear(latent_dim, self.embed_dim)
+            self.latent_context_proj = nn.Linear(self.z_embed_dim, self.embed_dim)
         else:
             self.latent_context_proj = None
 
@@ -237,7 +291,7 @@ class VAEDecoder(nn.Module):
 
         if self.prefix_fanout:
             # RoPE-safe fan-out: pool z → M prefix embeddings (M×embed_dim — tiny).
-            self.fanout_prefix_proj = nn.Linear(latent_dim, kv_fanout_len * self.embed_dim)
+            self.fanout_prefix_proj = nn.Linear(self.z_prefix_dim, kv_fanout_len * self.embed_dim)
             self.fanout_dropout = nn.Dropout(0.1)
             logger.info(
                 "Fan-out via PREFIX (%d soft-prompt tokens) for RoPE decoder %s",
@@ -252,7 +306,7 @@ class VAEDecoder(nn.Module):
             self.n_kv_head = n_kv_head
             self.kv_head_dim = self.hidden // n_head
             self.kv_proj = nn.Linear(
-                latent_dim,
+                self.z_kv_dim,
                 self.n_layer * 2 * n_kv_head * self.kv_head_dim * self.kv_mem_len
                 if self.kv_fanout
                 else self.n_layer * 2 * n_kv_head * self.kv_head_dim,
@@ -267,6 +321,26 @@ class VAEDecoder(nn.Module):
                 )
             else:
                 logger.info("kv_proj: %.0fM params (kv_fanout_len=%d)", kv_params / 1e6, self.kv_mem_len)
+
+        # Deep embedding injection: give the embedding channel the same
+        # per-layer reach as deep_inject already gives KV. A forward hook per
+        # decoder block adds a learned projection of the (embedding-slice) latent
+        # to that block's output hidden state, so the signal is refreshed at
+        # every layer instead of riding the residual stream unaided from the
+        # input layer alone.
+        self.deep_embed_inject = deep_embed_inject
+        self.deep_embed_proj = None
+        self._deep_embed_bias: list = []
+        if deep_embed_inject:
+            layers = _find_decoder_layers(self.lm)
+            self.deep_embed_proj = nn.ModuleList(
+                nn.Linear(self.z_embed_dim, self.hidden) for _ in range(len(layers))
+            )
+            for i, layer in enumerate(layers):
+                layer.register_forward_hook(self._make_deep_embed_hook(i))
+            logger.info(
+                "Deep embedding injection: %d per-layer hooks on %s", len(layers), model_name
+            )
 
     # ------------------------------------------------------------------
     def _input_embeddings(self) -> nn.Module:
@@ -289,12 +363,13 @@ class VAEDecoder(nn.Module):
                 f"Decoder expects z of shape (B, {self.num_latent_tokens}, latent_dim); "
                 f"got {tuple(z.shape)}"
             )
+        z_p = z[..., self._z_prefix_sl]  # (B, K, z_prefix_dim)
         if self.prefix_inject:
-            prefix = self.latent_proj(z) + self.prefix_pos_embed  # (B, K, H)
+            prefix = self.latent_proj(z_p) + self.prefix_pos_embed  # (B, K, H)
         else:
             prefix = self.prefix_pos_embed.expand(z.size(0), -1, -1)  # (B, K, H)
         if self.prefix_fanout:
-            pooled = z.mean(dim=1)  # (B, latent_dim)
+            pooled = z_p.mean(dim=1)  # (B, z_prefix_dim)
             fan = self.fanout_dropout(self.fanout_prefix_proj(pooled))  # (B, M*embed_dim)
             fan = fan.view(z.size(0), self.fanout_prefix_len, self.embed_dim)  # (B, M, embed_dim)
             prefix = torch.cat([prefix, fan], dim=1)  # (B, K+M, H)
@@ -303,8 +378,37 @@ class VAEDecoder(nn.Module):
     def _context(self, z: torch.Tensor) -> torch.Tensor | None:
         if self.latent_context_proj is None:
             return None
-        ctx = self.latent_context_proj(z.mean(dim=1, keepdim=True))  # (B, 1, H)
+        z_e = z[..., self._z_embed_sl]  # (B, K, z_embed_dim)
+        ctx = self.latent_context_proj(z_e.mean(dim=1, keepdim=True))  # (B, 1, H)
         return ctx.to(self.compute_dtype)
+
+    def _make_deep_embed_hook(self, layer_idx: int):
+        """Forward hook adding the per-layer embedding bias to a block's output.
+
+        Handles both HF return shapes: a bare hidden-state tensor, or a tuple
+        with hidden-state first (present/attentions after). Reads the bias set
+        by :meth:`_set_deep_embed_bias` right before the ``self.lm(...)`` call
+        this hook fires inside of.
+        """
+
+        def hook(module, inputs, output):
+            if not self._deep_embed_bias:
+                return output
+            bias = self._deep_embed_bias[layer_idx]  # (B, 1, hidden)
+            if isinstance(output, tuple):
+                return (output[0] + bias,) + output[1:]
+            return output + bias
+
+        return hook
+
+    def _set_deep_embed_bias(self, z: torch.Tensor) -> None:
+        if not self.deep_embed_inject:
+            return
+        z_e = z[..., self._z_embed_sl]  # (B, K, z_embed_dim)
+        pooled = z_e.mean(dim=1, keepdim=True)  # (B, 1, z_embed_dim)
+        self._deep_embed_bias = [
+            proj(pooled).to(self.compute_dtype) for proj in self.deep_embed_proj
+        ]
 
     def _past_kv(self, z: torch.Tensor) -> object | None:
         """``(B, K, latent_dim)`` → per-layer K-slot key/value memory.
@@ -314,17 +418,18 @@ class VAEDecoder(nn.Module):
         """
         if self.kv_proj is None:
             return None
-        B, K, _ = z.shape
+        z_k = z[..., self._z_kv_sl]  # (B, K, z_kv_dim)
+        B, K, _ = z_k.shape
         if self.kv_fanout:
             # Pool the latent to a SINGLE vector and fan it into M=kv_mem_len KV
             # slots per layer (LangVAE-style). At K=1 the mean is just the vector.
             M = self.kv_mem_len
-            pooled = z.mean(dim=1)  # (B, latent_dim)
+            pooled = z_k.mean(dim=1)  # (B, z_kv_dim)
             kv = self.kv_dropout(self.kv_proj(pooled))  # (B, n_layer*2*n_kv_head*M*hd)
             kv = kv.view(B, self.n_layer, 2, self.n_kv_head, M, self.kv_head_dim)
             kv = kv.permute(1, 2, 0, 3, 4, 5)  # (n_layer, 2, B, n_kv_head, M, hd)
         else:
-            kv = self.kv_proj(z)  # (B, K, n_layer * 2 * n_kv_head * head_dim)
+            kv = self.kv_proj(z_k)  # (B, K, n_layer * 2 * n_kv_head * head_dim)
             kv = kv.view(B, K, self.n_layer, 2, self.n_kv_head, self.kv_head_dim)
             kv = kv.permute(2, 3, 0, 4, 1, 5)  # (n_layer, 2, B, n_kv_head, K, hd)
         kv = kv.to(self.compute_dtype)  # match the (possibly bf16) LM attention
@@ -401,6 +506,7 @@ class VAEDecoder(nn.Module):
             attn = torch.cat(
                 [torch.ones(B, M, dtype=mask.dtype, device=mask.device), attn], dim=1
             )
+        self._set_deep_embed_bias(z)
         out = self.lm(
             inputs_embeds=inputs_embeds,
             attention_mask=attn,
@@ -438,6 +544,7 @@ class VAEDecoder(nn.Module):
         ctx = self._context(z)
         prefix = self._prefix(z)  # (B, prefix_len, H)
         embed = self._input_embeddings()
+        self._set_deep_embed_bias(z)  # constant across steps — z doesn't change
 
         generated: list[torch.Tensor] = []
         finished = torch.zeros(B, dtype=torch.bool, device=device)

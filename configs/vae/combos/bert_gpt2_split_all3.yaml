@@ -1,0 +1,25 @@
+# Ablation: all 3 injection channels (prefix, embedding, KV) active, each on
+# its own dedicated latent slice instead of sharing the full z.
+# Layer this OVER base.yaml + default.yaml + combos/bert_gpt2.yaml:
+#   python -m src.pipelines.train_vae \
+#       --config configs/base.yaml configs/vae/default.yaml \
+#                configs/vae/combos/bert_gpt2.yaml \
+#                configs/vae/combos/bert_gpt2_split_all3.yaml
+#
+# channel_split_dims: [48, 48, 32] — KV keeps the same 32-dim slice as
+# bert_gpt2_kvonly_split32.yaml (matched capacity); the other 96 dims that sit
+# idle in that run are spent here on prefix (48) + embedding (48). Comparing
+# the two isolates whether spending that budget on prefix/embedding beats
+# leaving it unused, at fixed KV capacity.
+#
+# deep_embed_inject: true — gives the embedding channel per-layer reach (via
+# forward hooks) instead of the single input-layer injection, so a loss here
+# can't be blamed on embedding's old weak delivery mechanism instead of on
+# channel redundancy.
+decoder:
+  prefix_inject: true
+  latent_pos_inject: true
+  deep_inject: true
+  split_latent_channels: true
+  channel_split_dims: [48, 48, 32]
+  deep_embed_inject: true
