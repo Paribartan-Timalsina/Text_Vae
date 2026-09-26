@@ -76,13 +76,19 @@ def _decoder_uses_rope(cfg) -> bool:
 
 def _build_cache(layers: tuple) -> object:
     """Wrap legacy ``((k, v), ...)`` layers in a ``Cache`` object when the
-    installed transformers requires it; fall back to the raw tuple."""
+    installed transformers requires it; fall back to the raw tuple.
+
+    Filled via ``update`` rather than ``from_legacy_cache``, which was removed
+    in transformers 5.x (and GPT-2 there rejects raw tuples).
+    """
     try:
         from transformers import DynamicCache
-
-        return DynamicCache.from_legacy_cache(layers)
-    except (ImportError, AttributeError):
+    except ImportError:
         return layers
+    cache = DynamicCache()
+    for idx, (k, v) in enumerate(layers):
+        cache.update(k, v, idx)
+    return cache
 
 
 class VAEDecoder(nn.Module):
